@@ -1,29 +1,40 @@
-// index.js - servidor mínimo compatible con Node 12 (Express 4)
+// index.js
 const express = require('express');
 const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// parse JSON (para recibir tu payload desde frontend)
+// Middleware: parse JSON bodies
 app.use(express.json());
 
-// sirve archivos estáticos desde ./public (pon tu HTML/CSS/JS ahí)
-app.use(express.static(path.join(__dirname, 'public')));
-
-// endpoint de prueba
-app.get('/ping', (req, res) => {
-  res.json({ ok: true, node: process.version });
+// === CORS sencillo (ajusta ORIGIN para seguridad) ===
+// Para pruebas puedes usar "*" pero en producción establece "https://<usuario>.github.io"
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+  res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  // Preflight
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
 });
 
-// endpoint simple para recibir form (ejemplo)
+// Servir archivos estáticos (tu frontend local durante pruebas)
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Ping
+app.get('/ping', (req, res) => res.json({ ok: true, node: process.version }));
+
+// Endpoint para recibir formulario
 app.post('/submit', (req, res) => {
-  console.log('POST /submit =>', req.body);
-  // aquí podrías guardar en base de datos, supabase, etc.
+  console.log('Datos recibidos /submit:', JSON.stringify(req.body, null, 2));
+  // Aquí insertas la lógica: guardar en base de datos, supabase, enviar correo, etc.
+  // Devolver respuesta
   res.json({ status: 'ok', received: Array.isArray(req.body.items) ? req.body.items.length : 0 });
 });
 
-// iniciar server
 app.listen(PORT, () => {
   console.log(`Servidor escuchando en http://localhost:${PORT}  (Node ${process.version})`);
+  console.log('ALLOWED_ORIGIN =', ALLOWED_ORIGIN);
 });
