@@ -1,45 +1,34 @@
 // index.js
-// Servidor mínimo listo para Render / local
-// Dependencias: express cors morgan
-// npm install express cors morgan
+// Servidor mínimo: sirve /public, agrega CORS por header, expone /ping y /submit
+// Requiere: npm install express
 
-const express = require("express");
-const cors = require("cors");
-const morgan = require("morgan");
-const fs = require("fs").promises;
-const path = require("path");
-const crypto = require("crypto");
-const util = require("util");
+const express = require('express');
+const path = require('path');
 
 const app = express();
 
-// Middlewares
-app.use(express.json({ limit: "2mb" }));
-app.use(morgan("combined"));
+// Puerto por defecto 10000 (puedes sobreescribir con process.env.PORT)
+const PORT = process.env.PORT || 10000;
 
-// CORS config: permite ORIGINS desde env ALLOW_ORIGINS (coma-separated) o cualquier origen si no definido
-const allowOriginsEnv = (process.env.ALLOW_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean);
-const corsOptions = allowOriginsEnv.length ? {
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // peticiones sin origin (curl, server-side)
-    if (allowOriginsEnv.includes(origin)) return cb(null, true);
-    return cb(new Error("CORS origin denied"));
-  }
-} : { origin: true }; // true => permite cualquier origen
-app.use(cors(corsOptions));
+// Dominio permitido por defecto (ajusta si quieres otro)
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'https://ioestomatolo-art.github.io';
 
-// Serve static files (tu frontend)
-// Coloca HTML/CSS/JS en /public (ej: public/Formu.html)
-app.use(express.static(path.join(__dirname, "public")));
+// Middleware para parsear JSON
+app.use(express.json({ limit: '2mb' }));
 
-// Datos / storage
-const DATA_DIR = path.join(__dirname, "data");
-const SUBMISSIONS_FILE = path.join(DATA_DIR, "submissions.json");
+// CORS básico (controlado por ALLOWED_ORIGIN)
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
 
-// Token opcional para proteger endpoints administrativos
-const API_TOKEN = process.env.API_TOKEN || "";
+// Servir frontend (pon tu Formu.html, Logica.js, Formato.css en ./public)
+app.use(express.static(path.join(__dirname, 'public')));
 
-// Lista de hospitales (la que pegaste). Cada item: { nombre, clave }
+// Lista de hospitales (puedes extender/poner en JSON externo)
 const HOSPITALES = [
   { nombre: "Centro de Alta Especialidad DR.Rafael Lucio", clave: "VZIM002330" },
   { nombre: "Centro de Saluud Con Hospitalizacion De Alto Lucero de Gutierrez Barrios,Ver.", clave: "VZIM008065" },
@@ -102,177 +91,41 @@ const HOSPITALES = [
   { nombre: "Uneme de Platon Sanchez", clave: "VZIM015545" }
 ];
 
-// STORAGE helpers
-async function ensureStorage() {
-  await fs.mkdir(DATA_DIR, { recursive: true });
-  try {
-    await fs.access(SUBMISSIONS_FILE);
-  } catch (e) {
-    await fs.writeFile(SUBMISSIONS_FILE, JSON.stringify([], null, 2), "utf8");
-  }
-}
+// Ping
+app.get('/ping', (req, res) => res.json({ ok: true, node: process.version }));
 
-async function readSubmissions() {
-  const content = await fs.readFile(SUBMISSIONS_FILE, "utf8");
-  try {
-    return JSON.parse(content || "[]");
-  } catch (e) {
-    // si JSON corrupto -> reset
-    await fs.writeFile(SUBMISSIONS_FILE, "[]", "utf8");
-    return [];
-  }
-}
-
-async function writeSubmissions(items) {
-  await fs.writeFile(SUBMISSIONS_FILE, JSON.stringify(items, null, 2), "utf8");
-}
-
-// middleware para checar token si API_TOKEN definido
-function requireTokenIfSet(req, res, next) {
-  if (!API_TOKEN) return next();
-  const authHeader = (req.headers.authorization || "").trim();
-  if (authHeader.toLowerCase().startsWith("bearer ")) {
-    const tk = authHeader.slice(7).trim();
-    if (tk === API_TOKEN) return next();
-  }
-  const bodyToken = req.body && req.body._token;
-  if (bodyToken && bodyToken === API_TOKEN) return next();
-  return res.status(401).json({ ok: false, error: "Unauthorized: missing or invalid token" });
-}
-
-// small helper: token check for GET /submissions endpoints (supports ?token= or Authorization)
-function checkTokenQueryOrHeader(req) {
-  if (!API_TOKEN) return true;
-  const authHeader = (req.headers.authorization || "").trim();
-  const tokenQuery = (req.query.token || "").trim();
-  if (authHeader.toLowerCase().startsWith("bearer ")) {
-    return authHeader.slice(7).trim() === API_TOKEN;
-  }
-  if (tokenQuery) return tokenQuery === API_TOKEN;
-  return false;
-}
-
-// Verbose logs toggle
-const VERBOSE = (process.env.VERBOSE_LOG === "1" || process.env.VERBOSE_LOG === "true");
-
-// ROUTES
-
-app.get("/health", (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
-
-// GET /hospitales?q=texto
-app.get("/hospitales", async (req, res) => {
-  try {
-    const q = (req.query.q || "").trim().toLowerCase();
-    if (!q) return res.json(HOSPITALES);
-    const filtered = HOSPITALES.filter(h =>
-      (h.nombre || "").toLowerCase().includes(q) || (h.clave || "").toLowerCase().includes(q)
-    );
-    return res.json(filtered);
-  } catch (e) {
-    console.error("Error /hospitales:", e);
-    return res.status(500).json({ ok: false, error: "error interno" });
-  }
+// GET /hospitales?q=texto -> autocompletar/filtrar por nombre o clave
+app.get('/hospitales', (req, res) => {
+  const q = (req.query.q || '').trim().toLowerCase();
+  if (!q) return res.json(HOSPITALES);
+  const filtered = HOSPITALES.filter(h =>
+    (h.nombre || '').toLowerCase().includes(q) || (h.clave || '').toLowerCase().includes(q)
+  );
+  res.json(filtered);
 });
 
-// POST /submit  -> guarda submission (requireTokenIfSet se aplica solo si API_TOKEN configurado)
-app.post("/submit", requireTokenIfSet, async (req, res) => {
+// POST /submit -> guarda/enruta (aquí solo registramos y respondemos)
+app.post('/submit', (req, res) => {
+  // Log de acceso (Render/NGINX también hará su propio acceso line)
   try {
-    const payload = req.body;
+    // Información resumida en una línea
+    const ua = req.headers['user-agent'] || '';
+    const origin = req.headers.origin || req.headers.referer || '';
+    console.log(`Request /submit from ${req.ip}  origin="${origin}"  ua="${ua}"`);
 
-    // Verbose logging (activar con VERBOSE_LOG=1)
-    if (VERBOSE) {
-      console.log("===== /submit payload received =====");
-      console.log(`From IP: ${req.ip}  User-Agent: ${req.headers['user-agent'] || ''}`);
-      console.log(`hospitalNombre: "${payload && payload.hospitalNombre ? payload.hospitalNombre : ''}"  hospitalClave: "${payload && payload.hospitalClave ? payload.hospitalClave : ''}"  categoria: "${payload && payload.categoria ? payload.categoria : ''}"  fechaEnvio: "${payload && payload.fechaEnvio ? payload.fechaEnvio : ''}"`);
-      const itemsCount = Array.isArray(payload && payload.items) ? payload.items.length : 0;
-      console.log(`items: ${itemsCount}`);
-      if (Array.isArray(payload && payload.items) && payload.items.length) {
-        payload.items.forEach((it, i) => {
-          const clave = it.clave || '';
-          const desc = (it.descripcion || '').replace(/\s+/g,' ').slice(0,140);
-          const stock = (it.stock === undefined || it.stock === null) ? '' : it.stock;
-          const fecha = it.fecha || '';
-          const dias = it.dias || '';
-          console.log(`#${i+1} clave="${clave}" stock="${stock}" fecha="${fecha}" dias="${dias}" desc="${desc}"`);
-        });
-      }
-      console.log("full payload (util.inspect):", util.inspect(payload, { depth: 6, maxArrayLength: null }));
-      console.log("====================================");
-    }
+    // Payload bonitamente formateado
+    console.log('Datos recibidos /submit:\n' + JSON.stringify(req.body, null, 2) + '\n');
 
-    // validación básica
-    if (!payload || typeof payload !== "object") return res.status(400).json({ ok: false, error: "payload inválido" });
-
-    const { hospitalNombre, hospitalClave, categoria, fechaEnvio, items } = payload;
-    if (!categoria || !Array.isArray(items) || items.length === 0) {
-      return res.status(400).json({ ok: false, error: "falta categoría o items" });
-    }
-
-    const submission = {
-      id: (crypto.randomUUID ? crypto.randomUUID() : (Date.now() + "-" + Math.floor(Math.random()*10000))),
-      hospitalNombre: hospitalNombre || "",
-      hospitalClave: hospitalClave || "",
-      categoria,
-      fechaEnvio: fechaEnvio || new Date().toISOString(),
-      items,
-      receivedAt: new Date().toISOString()
-    };
-
-    await ensureStorage();
-    const existing = await readSubmissions();
-    existing.push(submission);
-    await writeSubmissions(existing);
-
-    if (VERBOSE) console.log(`Saved submission id=${submission.id} items=${items.length}`);
-
-    return res.json({ ok: true, id: submission.id, savedAt: submission.receivedAt });
-  } catch (e) {
-    console.error("Error /submit:", e);
-    return res.status(500).json({ ok: false, error: "error guardando submission" });
+  } catch (err) {
+    console.error('Error imprimiendo payload:', err);
   }
+
+  // Respuesta simple (aquí puedes añadir persistencia)
+  res.json({ status: 'ok', received: Array.isArray(req.body.items) ? req.body.items.length : 0 });
 });
 
-// GET /submissions  -> requiere token si API_TOKEN establecido
-app.get("/submissions", async (req, res) => {
-  if (API_TOKEN) {
-    if (!checkTokenQueryOrHeader(req)) return res.status(401).json({ ok: false, error: "Unauthorized" });
-  }
-  try {
-    await ensureStorage();
-    const existing = await readSubmissions();
-    return res.json(existing);
-  } catch (e) {
-    console.error("Error /submissions:", e);
-    return res.status(500).json({ ok: false, error: "error leyendo submissions" });
-  }
-});
-
-// GET /submissions/:id
-app.get("/submissions/:id", async (req, res) => {
-  if (API_TOKEN) {
-    if (!checkTokenQueryOrHeader(req)) return res.status(401).json({ ok: false, error: "Unauthorized" });
-  }
-  try {
-    await ensureStorage();
-    const existing = await readSubmissions();
-    const found = existing.find(x => x.id === req.params.id);
-    if (!found) return res.status(404).json({ ok: false, error: "no encontrado" });
-    return res.json(found);
-  } catch (e) {
-    console.error("Error /submissions/:id", e);
-    return res.status(500).json({ ok: false, error: "error interno" });
-  }
-});
-
-// START
-const PORT = parseInt(process.env.PORT || "3000", 10);
-ensureStorage().then(() => {
-  app.listen(PORT, () => {
-    console.log(`Servidor iniciado en puerto ${PORT} (PID:${process.pid})`);
-    if (API_TOKEN) console.log("API_TOKEN está configurado (endpoints protegidos).");
-    if (VERBOSE) console.log("VERBOSE_LOG activo: imprimir payloads recibidos en logs.");
-  });
-}).catch(err => {
-  console.error("No se pudo iniciar el servidor:", err);
-  process.exit(1);
+// Start server
+app.listen(PORT, () => {
+  console.log(`Servidor escuchando en http://localhost:${PORT}  (Node ${process.version})`);
+  console.log('ALLOWED_ORIGIN =', ALLOWED_ORIGIN);
 });
