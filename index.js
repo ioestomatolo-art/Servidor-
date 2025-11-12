@@ -1,20 +1,4 @@
-// index.js
-// Servidor mínimo para Render: endpoints /hospitales, /submit, /submissions
-// Requisitos: node >= 14.17 (crypto.randomUUID) ; instalar dependencias: express cors morgan
-//
-// Variables de entorno (opcional):
-//   PORT        -> puerto (Render lo inyecta automáticamente)
-//   API_TOKEN   -> token opcional para proteger endpoints de lectura/escritura administrativos
-//   ALLOW_ORIGINS -> (opcional) orígenes permitidos por CORS (separados por comas). Si no, se permite '*'
-//
-// Rutas principales:
-//   GET  /hospitales     -> devuelve lista [{ nombre, clave }, ...]. acepta ?q=texto para filtrar.
-//   POST /submit         -> recibe payload del frontend y lo guarda (no requiere token por defecto).
-//   GET  /submissions    -> devuelve array de envíos (requiere token si API_TOKEN definido).
-//   GET  /health         -> OK
-//
-// Nota: en producción considera añadir validación más estricta, HTTPS, rate limiting y backups.
-
+// index.js - Servidor unificado: static + API /hospitales /submit /submissions /health
 const express = require("express");
 const cors = require("cors");
 const morgan = require("morgan");
@@ -23,38 +7,55 @@ const path = require("path");
 const crypto = require("crypto");
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 app.use(morgan("combined"));
 
-// CORS configurado por env (opcional)
+// CORS configurable vía env ALLOW_ORIGINS (coma-separados). Si no hay, permite cualquier origen.
 const allowOriginsEnv = (process.env.ALLOW_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean);
-const corsOptions = allowOriginsEnv.length ? { origin: (origin, cb) => {
-  if (!origin) return cb(null, true); // permitir peticiones sin origin (curl, server-side)
-  if (allowOriginsEnv.includes(origin)) return cb(null, true);
-  return cb(new Error("CORS origin denied"));
-}} : { origin: true }; // true => permite cualquier origen
+const corsOptions = allowOriginsEnv.length ? {
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true); // requests server-side or curl
+    if (allowOriginsEnv.includes(origin)) return cb(null, true);
+    return cb(new Error("CORS origin denied"));
+  }
+} : { origin: true };
 app.use(cors(corsOptions));
 
+// Rutas estáticas: sirve tu frontend si lo pones en ./public
+const publicDir = path.join(__dirname, "public");
+app.use(express.static(publicDir));
+
+// Storage
 const DATA_DIR = path.join(__dirname, "data");
 const SUBMISSIONS_FILE = path.join(DATA_DIR, "submissions.json");
-
-// token optional
 const API_TOKEN = process.env.API_TOKEN || "";
 
-// Asegura directorio data y archivo inicial
+// Asegura storage inicial
 async function ensureStorage() {
   await fs.mkdir(DATA_DIR, { recursive: true });
   try {
     await fs.access(SUBMISSIONS_FILE);
   } catch (e) {
-    // crea archivo vacío
-    await fs.writeFile(SUBMISSIONS_FILE, JSON.stringify([], null, 2), "utf8");
+    await fs.writeFile(SUBMISSIONS_FILE, "[]", "utf8");
   }
 }
 
-// Lista de hospitales (usé la lista que me pegaste).
-// Cada item: { nombre: "...", clave: "VZIMxxxx" }
-// Si quieres actualizarla desde archivo, podemos mover esto a data/hospitales.json
+async function readSubmissions() {
+  try {
+    const content = await fs.readFile(SUBMISSIONS_FILE, "utf8");
+    return JSON.parse(content || "[]");
+  } catch (e) {
+    // si hay problema, inicializa archivo
+    await fs.writeFile(SUBMISSIONS_FILE, "[]", "utf8");
+    return [];
+  }
+}
+
+async function writeSubmissions(items) {
+  await fs.writeFile(SUBMISSIONS_FILE, JSON.stringify(items, null, 2), "utf8");
+}
+
+// Lista de hospitales (la que me pegaste)
 const HOSPITALES = [
   { nombre: "Centro de Alta Especialidad DR.Rafael Lucio", clave: "VZIM002330" },
   { nombre: "Centro de Saluud Con Hospitalizacion De Alto Lucero de Gutierrez Barrios,Ver.", clave: "VZIM008065" },
@@ -117,69 +118,41 @@ const HOSPITALES = [
   { nombre: "Uneme de Platon Sanchez", clave: "VZIM015545" }
 ];
 
-// Helper: lee submissions
-async function readSubmissions() {
-  const content = await fs.readFile(SUBMISSIONS_FILE, "utf8");
-  try {
-    return JSON.parse(content || "[]");
-  } catch (e) {
-    // si el JSON está corrupto, renueva archivo (prevención)
-    await fs.writeFile(SUBMISSIONS_FILE, "[]", "utf8");
-    return [];
-  }
-}
-
-// Helper: guarda submissions (array)
-async function writeSubmissions(items) {
-  await fs.writeFile(SUBMISSIONS_FILE, JSON.stringify(items, null, 2), "utf8");
-}
-
-// Middleware simple para checar token si API_TOKEN está configurado
+// Middleware: chequeo token si está configurado
 function requireTokenIfSet(req, res, next) {
   if (!API_TOKEN) return next();
   const authHeader = (req.headers.authorization || "").trim();
-  // soporta Authorization: Bearer <token> o _token en body
   if (authHeader.toLowerCase().startsWith("bearer ")) {
-    const tk = authHeader.slice(7).trim();
-    if (tk === API_TOKEN) return next();
+    if (authHeader.slice(7).trim() === API_TOKEN) return next();
   }
   const bodyToken = req.body && req.body._token;
   if (bodyToken && bodyToken === API_TOKEN) return next();
   return res.status(401).json({ ok: false, error: "Unauthorized: missing or invalid token" });
 }
 
-// HEALTH
+// Endpoints
 app.get("/health", (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
-// GET /hospitales?q=texto   -> devuelve lista filtrada por texto (nombre o clave)
-app.get("/hospitales", async (req, res) => {
-  try {
-    const q = (req.query.q || "").trim().toLowerCase();
-    if (!q) return res.json(HOSPITALES);
-    const filtered = HOSPITALES.filter(h =>
-      (h.nombre || "").toLowerCase().includes(q) || (h.clave || "").toLowerCase().includes(q)
-    );
-    return res.json(filtered);
-  } catch (e) {
-    console.error("Error /hospitales:", e);
-    return res.status(500).json({ ok: false, error: "error interno" });
-  }
+app.get("/hospitales", (req, res) => {
+  const q = (req.query.q || "").trim().toLowerCase();
+  if (!q) return res.json(HOSPITALES);
+  const filtered = HOSPITALES.filter(h =>
+    (h.nombre || "").toLowerCase().includes(q) || (h.clave || "").toLowerCase().includes(q)
+  );
+  res.json(filtered);
 });
 
-// POST /submit  -> recibe payload del frontend y lo guarda
-// No requiere token por defecto; si quieres exigir token pon requireTokenIfSet como middleware
 app.post("/submit", requireTokenIfSet, async (req, res) => {
   try {
     const payload = req.body;
-    // validación básica
     if (!payload || typeof payload !== "object") return res.status(400).json({ ok: false, error: "payload inválido" });
 
+    // acepta hospitalNombre OR hospitalClave, items es array
     const { hospitalNombre, hospitalClave, categoria, fechaEnvio, items } = payload;
     if (!categoria || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ ok: false, error: "falta categoría o items" });
     }
 
-    // crea objeto de guardado
     const submission = {
       id: (crypto.randomUUID ? crypto.randomUUID() : (Date.now() + "-" + Math.floor(Math.random()*10000))),
       hospitalNombre: hospitalNombre || "",
@@ -196,44 +169,38 @@ app.post("/submit", requireTokenIfSet, async (req, res) => {
     await writeSubmissions(existing);
 
     return res.json({ ok: true, id: submission.id, savedAt: submission.receivedAt });
-  } catch (e) {
-    console.error("Error /submit:", e);
+  } catch (err) {
+    console.error("Error /submit:", err);
     return res.status(500).json({ ok: false, error: "error guardando submission" });
   }
 });
 
-// GET /submissions  -> listar envíos (restringido si API_TOKEN definido)
 app.get("/submissions", async (req, res) => {
+  // requiere token si API_TOKEN definido
   if (API_TOKEN) {
-    // checar Authorization o ?token=
     const authHeader = (req.headers.authorization || "").trim();
     const tokenQuery = (req.query.token || "").trim();
     let ok = false;
-    if (authHeader.toLowerCase().startsWith("bearer ")) {
-      ok = authHeader.slice(7).trim() === API_TOKEN;
-    }
+    if (authHeader.toLowerCase().startsWith("bearer ")) ok = authHeader.slice(7).trim() === API_TOKEN;
     if (!ok && tokenQuery) ok = tokenQuery === API_TOKEN;
     if (!ok) return res.status(401).json({ ok: false, error: "Unauthorized" });
   }
   try {
     await ensureStorage();
     const existing = await readSubmissions();
-    return res.json(existing);
-  } catch (e) {
-    console.error("Error /submissions:", e);
-    return res.status(500).json({ ok: false, error: "error leyendo submissions" });
+    res.json(existing);
+  } catch (err) {
+    console.error("Error /submissions:", err);
+    res.status(500).json({ ok: false, error: "error leyendo submissions" });
   }
 });
 
-// Dev helper: GET /submissions/:id
 app.get("/submissions/:id", async (req, res) => {
   if (API_TOKEN) {
     const authHeader = (req.headers.authorization || "").trim();
     const tokenQuery = (req.query.token || "").trim();
     let ok = false;
-    if (authHeader.toLowerCase().startsWith("bearer ")) {
-      ok = authHeader.slice(7).trim() === API_TOKEN;
-    }
+    if (authHeader.toLowerCase().startsWith("bearer ")) ok = authHeader.slice(7).trim() === API_TOKEN;
     if (!ok && tokenQuery) ok = tokenQuery === API_TOKEN;
     if (!ok) return res.status(401).json({ ok: false, error: "Unauthorized" });
   }
@@ -242,12 +209,15 @@ app.get("/submissions/:id", async (req, res) => {
     const existing = await readSubmissions();
     const found = existing.find(x => x.id === req.params.id);
     if (!found) return res.status(404).json({ ok: false, error: "no encontrado" });
-    return res.json(found);
-  } catch (e) {
-    console.error("Error /submissions/:id", e);
-    return res.status(500).json({ ok: false, error: "error interno" });
+    res.json(found);
+  } catch (err) {
+    console.error("Error /submissions/:id", err);
+    res.status(500).json({ ok: false, error: "error interno" });
   }
 });
+
+// Fallback: si no hay static, puedes comprobar /ping
+app.get("/ping", (req, res) => res.json({ ok: true, node: process.version }));
 
 // Start
 const PORT = parseInt(process.env.PORT || "3000", 10);

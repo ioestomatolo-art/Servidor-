@@ -1,16 +1,17 @@
 {
-  "name": "servidor",
+  "name": "inventario-server",
   "version": "1.0.0",
-  "description": "servidor de prueba",
+  "description": "Servidor para recibir envíos de inventario",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js"
   },
-  "author": "SS",
-  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
-    "express": "^4.18.2"
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "morgan": "^1.10.0"
   }
 }
