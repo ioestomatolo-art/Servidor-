@@ -1,34 +1,31 @@
-// index.js
-// Servidor mínimo: sirve /public, agrega CORS por header, expone /ping y /submit
-// Requiere: npm install express
-
-const express = require('express');
-const path = require('path');
+// index.js - API mínima para hospitals + submissions + inventories
+const express = require("express");
+const cors = require("cors");
+const morgan = require("morgan");
+const fs = require("fs").promises;
+const path = require("path");
+const crypto = require("crypto");
 
 const app = express();
+app.use(express.json({ limit: "2mb" }));
+app.use(morgan("combined"));
 
-// Puerto por defecto 10000 (puedes sobreescribir con process.env.PORT)
-const PORT = process.env.PORT || 10000;
+// CORS configurable vía env ALLOW_ORIGINS (coma-separados). Si no, permite cualquier origen.
+const allowOriginsEnv = (process.env.ALLOW_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean);
+const corsOptions = allowOriginsEnv.length ? { origin: (origin, cb) => {
+  if (!origin) return cb(null, true);
+  if (allowOriginsEnv.includes(origin)) return cb(null, true);
+  return cb(new Error("CORS origin denied"));
+}} : { origin: true };
+app.use(cors(corsOptions));
 
-// Dominio permitido por defecto (ajusta si quieres otro)
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'https://ioestomatolo-art.github.io';
+const DATA_DIR = path.join(__dirname, "data");
+const SUBMISSIONS_FILE = path.join(DATA_DIR, "submissions.json");
+const INVENT_DIR = path.join(DATA_DIR, "inventories");
 
-// Middleware para parsear JSON
-app.use(express.json({ limit: '2mb' }));
+const API_TOKEN = process.env.API_TOKEN || ""; // si se configura, protege endpoints de escritura
 
-// CORS básico (controlado por ALLOWED_ORIGIN)
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-  res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
-  next();
-});
-
-// Servir frontend (pon tu Formu.html, Logica.js, Formato.css en ./public)
-app.use(express.static(path.join(__dirname, 'public')));
-
-// Lista de hospitales (puedes extender/poner en JSON externo)
+// Lista de hospitales (usé la lista que me pegaste)
 const HOSPITALES = [
   { nombre: "Centro de Alta Especialidad DR.Rafael Lucio", clave: "VZIM002330" },
   { nombre: "Centro de Saluud Con Hospitalizacion De Alto Lucero de Gutierrez Barrios,Ver.", clave: "VZIM008065" },
@@ -91,41 +88,173 @@ const HOSPITALES = [
   { nombre: "Uneme de Platon Sanchez", clave: "VZIM015545" }
 ];
 
-// Ping
-app.get('/ping', (req, res) => res.json({ ok: true, node: process.version }));
-
-// GET /hospitales?q=texto -> autocompletar/filtrar por nombre o clave
-app.get('/hospitales', (req, res) => {
-  const q = (req.query.q || '').trim().toLowerCase();
-  if (!q) return res.json(HOSPITALES);
-  const filtered = HOSPITALES.filter(h =>
-    (h.nombre || '').toLowerCase().includes(q) || (h.clave || '').toLowerCase().includes(q)
-  );
-  res.json(filtered);
-});
-
-// POST /submit -> guarda/enruta (aquí solo registramos y respondemos)
-app.post('/submit', (req, res) => {
-  // Log de acceso (Render/NGINX también hará su propio acceso line)
+// helpers de FS
+async function ensureStorage() {
+  await fs.mkdir(DATA_DIR, { recursive: true });
+  await fs.mkdir(INVENT_DIR, { recursive: true });
   try {
-    // Información resumida en una línea
-    const ua = req.headers['user-agent'] || '';
-    const origin = req.headers.origin || req.headers.referer || '';
-    console.log(`Request /submit from ${req.ip}  origin="${origin}"  ua="${ua}"`);
-
-    // Payload bonitamente formateado
-    console.log('Datos recibidos /submit:\n' + JSON.stringify(req.body, null, 2) + '\n');
-
-  } catch (err) {
-    console.error('Error imprimiendo payload:', err);
+    await fs.access(SUBMISSIONS_FILE);
+  } catch (e) {
+    await fs.writeFile(SUBMISSIONS_FILE, JSON.stringify([], null, 2), "utf8");
   }
+}
+async function readJsonSafe(filePath) {
+  try {
+    const content = await fs.readFile(filePath, "utf8");
+    return JSON.parse(content || "[]");
+  } catch (e) {
+    return null;
+  }
+}
+async function writeJsonSafe(filePath, obj) {
+  await fs.writeFile(filePath, JSON.stringify(obj, null, 2), "utf8");
+}
+function safeFileNameSegment(s) {
+  if (!s) return "unknown";
+  return String(s).replace(/[^a-z0-9\-_]/ig, "_").slice(0, 120);
+}
+function requireTokenIfSet(req, res, next) {
+  if (!API_TOKEN) return next();
+  const authHeader = (req.headers.authorization || "").trim();
+  if (authHeader.toLowerCase().startsWith("bearer ")) {
+    const tk = authHeader.slice(7).trim();
+    if (tk === API_TOKEN) return next();
+  }
+  const bodyToken = req.body && req.body._token;
+  if (bodyToken && bodyToken === API_TOKEN) return next();
+  return res.status(401).json({ ok: false, error: "Unauthorized: missing/invalid token" });
+}
 
-  // Respuesta simple (aquí puedes añadir persistencia)
-  res.json({ status: 'ok', received: Array.isArray(req.body.items) ? req.body.items.length : 0 });
+// HEALTH
+app.get("/health", (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
+
+// HOSPITALES endpoint (GET /hospitales?q=...)
+app.get("/hospitales", (req, res) => {
+  try {
+    const q = (req.query.q || "").trim().toLowerCase();
+    if (!q) return res.json(HOSPITALES);
+    const filtered = HOSPITALES.filter(h =>
+      (h.nombre || "").toLowerCase().includes(q) || (h.clave || "").toLowerCase().includes(q)
+    );
+    return res.json(filtered);
+  } catch (e) {
+    console.error("Error /hospitales:", e);
+    return res.status(500).json({ ok: false, error: "error interno" });
+  }
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`Servidor escuchando en http://localhost:${PORT}  (Node ${process.version})`);
-  console.log('ALLOWED_ORIGIN =', ALLOWED_ORIGIN);
+// submissions: guarda envíos históricos
+app.post("/submit", requireTokenIfSet, async (req, res) => {
+  try {
+    const payload = req.body;
+    if (!payload || typeof payload !== "object") return res.status(400).json({ ok: false, error: "payload inválido" });
+    const submission = {
+      id: (crypto.randomUUID ? crypto.randomUUID() : (Date.now() + "-" + Math.floor(Math.random()*10000))),
+      ...payload,
+      receivedAt: new Date().toISOString()
+    };
+    await ensureStorage();
+    const existing = await readJsonSafe(SUBMISSIONS_FILE) || [];
+    existing.push(submission);
+    await writeJsonSafe(SUBMISSIONS_FILE, existing);
+    return res.json({ ok: true, id: submission.id, savedAt: submission.receivedAt });
+  } catch (e) {
+    console.error("Error /submit:", e);
+    return res.status(500).json({ ok: false, error: "error guardando submission" });
+  }
+});
+
+// GET /inventory?hospitalClave=...&categoria=...
+app.get("/inventory", async (req, res) => {
+  try {
+    const hospitalClave = (req.query.hospitalClave || req.query.hospitalNombre || "").trim();
+    const categoria = (req.query.categoria || "").trim();
+    if (!hospitalClave || !categoria) return res.json([]);
+    const fileName = `${safeFileNameSegment(hospitalClave)}--${safeFileNameSegment(categoria)}.json`;
+    const filePath = path.join(INVENT_DIR, fileName);
+    const data = await readJsonSafe(filePath);
+    if (data === null) return res.json([]);
+    return res.json(data);
+  } catch (e) {
+    console.error("Error GET /inventory:", e);
+    return res.status(500).json({ ok: false, error: "error leyendo inventory" });
+  }
+});
+
+// POST /inventory -> guarda inventario para hospital+categoria (restringido si API_TOKEN)
+app.post("/inventory", requireTokenIfSet, async (req, res) => {
+  try {
+    const { hospitalClave, hospitalNombre, categoria, items } = req.body || {};
+    if (!categoria || !items || !Array.isArray(items)) return res.status(400).json({ ok:false, error:"falta categoria o items" });
+    const key = (hospitalClave && hospitalClave.trim()) || (hospitalNombre && hospitalNombre.trim()) || `unknown-${Date.now()}`;
+    const fileName = `${safeFileNameSegment(key)}--${safeFileNameSegment(categoria)}.json`;
+    const filePath = path.join(INVENT_DIR, fileName);
+    const payload = {
+      savedAt: new Date().toISOString(),
+      hospitalClave: hospitalClave || "",
+      hospitalNombre: hospitalNombre || "",
+      categoria,
+      items
+    };
+    await ensureStorage();
+    await writeJsonSafe(filePath, payload);
+    return res.json({ ok: true, savedAt: payload.savedAt, file: fileName });
+  } catch (e) {
+    console.error("Error POST /inventory:", e);
+    return res.status(500).json({ ok:false, error:"error guardando inventory" });
+  }
+});
+
+// GET /submissions (admin)
+app.get("/submissions", async (req, res) => {
+  if (API_TOKEN) {
+    const authHeader = (req.headers.authorization || "").trim();
+    const tokenQuery = (req.query.token || "").trim();
+    let ok = false;
+    if (authHeader.toLowerCase().startsWith("bearer ")) ok = authHeader.slice(7).trim() === API_TOKEN;
+    if (!ok && tokenQuery) ok = tokenQuery === API_TOKEN;
+    if (!ok) return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+  try {
+    await ensureStorage();
+    const existing = await readJsonSafe(SUBMISSIONS_FILE) || [];
+    return res.json(existing);
+  } catch (e) {
+    console.error("Error /submissions:", e);
+    return res.status(500).json({ ok:false, error:"error leyendo submissions" });
+  }
+});
+
+// Dev: GET /submissions/:id
+app.get("/submissions/:id", async (req, res) => {
+  if (API_TOKEN) {
+    const authHeader = (req.headers.authorization || "").trim();
+    const tokenQuery = (req.query.token || "").trim();
+    let ok = false;
+    if (authHeader.toLowerCase().startsWith("bearer ")) ok = authHeader.slice(7).trim() === API_TOKEN;
+    if (!ok && tokenQuery) ok = tokenQuery === API_TOKEN;
+    if (!ok) return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+  try {
+    await ensureStorage();
+    const existing = await readJsonSafe(SUBMISSIONS_FILE) || [];
+    const found = existing.find(x => x.id === req.params.id);
+    if (!found) return res.status(404).json({ ok: false, error: "no encontrado" });
+    return res.json(found);
+  } catch (e) {
+    console.error("Error /submissions/:id", e);
+    return res.status(500).json({ ok: false, error: "error interno" });
+  }
+});
+
+// START
+const PORT = parseInt(process.env.PORT || "3000", 10);
+ensureStorage().then(() => {
+  app.listen(PORT, () => {
+    console.log(`Servidor iniciado en puerto ${PORT} (PID:${process.pid})`);
+    if (API_TOKEN) console.log("API_TOKEN está configurado (endpoints protegidos).");
+  });
+}).catch(err => {
+  console.error("No se pudo iniciar el servidor:", err);
+  process.exit(1);
 });
