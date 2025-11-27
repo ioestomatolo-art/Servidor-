@@ -28,7 +28,7 @@ const API_TOKEN = process.env.API_TOKEN || ""; // si se configura, protege endpo
 // Lista de hospitales (usé la lista que me pegaste)
 const HOSPITALES = [
   { nombre: "Centro de Alta Especialidad DR.Rafael Lucio", clave: "VZIM002330" },
-  { nombre: "Centro de Saluud Con Hospitalizacion De Alto Lucero de Gutierrez Barrios,Ver.", clave: "VZIM008065" },
+  { nombre: "Centro de Salud Con Hospitalizacion De Alto Lucero de Gutierrez Barrios,Ver.", clave: "VZIM008065" },
   { nombre: "Centro De Salud con Hospitalizacion De la localidad de Allende, Ver.", clave: "VZIM007942" },
   { nombre: "Centro Estatal de Cancerologia Dr.Miguel Dorantes Mesa", clave: "VZIM002325" },
   { nombre: "Hospital Comunitario de Ixhuatlan del Sureste", clave: "VZIM002120" },
