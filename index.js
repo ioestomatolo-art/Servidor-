@@ -1,4 +1,4 @@
-// index.js - API mínima para hospitals + submissions + inventories
+// index.js - API mínima para hospitals + submissions + inventories + report
 const express = require("express");
 const cors = require("cors");
 const morgan = require("morgan");
@@ -25,7 +25,7 @@ const INVENT_DIR = path.join(DATA_DIR, "inventories");
 
 const API_TOKEN = process.env.API_TOKEN || ""; // si se configura, protege endpoints de escritura
 
-// Lista de hospitales (usé la lista que me pegaste)
+// Lista de hospitales (la que nos pasaste)
 const HOSPITALES = [
   { nombre: "Centro de Alta Especialidad DR.Rafael Lucio", clave: "VZIM002330" },
   { nombre: "Centro de Salud Con Hospitalizacion De Alto Lucero de Gutierrez Barrios,Ver.", clave: "VZIM008065" },
@@ -46,7 +46,7 @@ const HOSPITALES = [
   { nombre: "Hospital de la Comunidad de Naolinco", clave: "VZIM007732" },
   { nombre: "Hospital de la Comunidad de Tempoal", clave: "VZIM004710" },
   { nombre: "Hospital de la comunidad de Teocelo", clave: "VZIM004775" },
-  { nombre: "Hospital de la Comunidad de Tezonapa", clave: "VZIM006146" },
+  { nombre: "Hospital de la comunidad de Tezonapa", clave: "VZIM006146" },
   { nombre: "Hospital de la comunidad de Tlaquilpan Vista Hermosa", clave: "VZIM006134" },
   { nombre: "Hospital de la Comunidad Dr.Pedro Coronel Perez", clave: "VZIM015425" },
   { nombre: "Hospital de la Comunidad La Laguna Poblado 6", clave: "VZIM007573" },
@@ -244,6 +244,105 @@ app.get("/submissions/:id", async (req, res) => {
   } catch (e) {
     console.error("Error /submissions/:id", e);
     return res.status(500).json({ ok: false, error: "error interno" });
+  }
+});
+
+/*
+  REPORT endpoint protegido: GET /report?format=csv|json
+  - Si API_TOKEN está configurado, requireTokenIfSet lo protegerá.
+  - Genera un CSV (una fila por item) con columnas: submissionId, receivedAt,
+    hospitalNombre, hospitalClave, categoria, fechaEnvio, clave, descripcion, stock,
+    minimo, fecha, dias, observaciones, color, manual
+*/
+app.get("/report", requireTokenIfSet, async (req, res) => {
+  try {
+    await ensureStorage();
+    const submissions = (await readJsonSafe(SUBMISSIONS_FILE)) || [];
+    if (!Array.isArray(submissions) || submissions.length === 0) {
+      return res.status(204).send();
+    }
+
+    const format = (req.query.format || "csv").toLowerCase();
+
+    const rows = [];
+    for (const s of submissions) {
+      const base = {
+        submissionId: s.id || "",
+        receivedAt: s.receivedAt || s.fechaEnvio || "",
+        hospitalNombre: s.hospitalNombre || "",
+        hospitalClave: s.hospitalClave || "",
+        categoria: s.categoria || "",
+        fechaEnvio: s.fechaEnvio || ""
+      };
+      const items = Array.isArray(s.items) ? s.items : [];
+      if (items.length === 0) {
+        rows.push({ ...base, clave: "", descripcion: "", stock: "", minimo: "", fecha: "", dias: "", observaciones: "", color: "", manual: "" });
+      } else {
+        for (const it of items) {
+          rows.push({
+            ...base,
+            clave: it.clave || "",
+            descripcion: it.descripcion || "",
+            stock: it.stock || "",
+            minimo: it.minimo || "",
+            fecha: it.fecha || "",
+            dias: it.dias || "",
+            observaciones: it.observaciones || "",
+            color: it.color || "",
+            manual: (it.manual === true || it.manual === "true") ? "true" : ""
+          });
+        }
+      }
+    }
+
+    if (format === "json") {
+      const filename = `report_submissions_${new Date().toISOString().slice(0,19).replace(/[:T]/g,"_")}.json`;
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+      return res.send(JSON.stringify(rows, null, 2));
+    }
+
+    // CSV
+    function csvEscape(v) {
+      if (v === null || v === undefined) return "";
+      const s = String(v);
+      if (/[,"\n\r]/.test(s)) {
+        return `"${s.replace(/"/g, '""')}"`;
+      }
+      return s;
+    }
+
+    const header = [
+      "submissionId",
+      "receivedAt",
+      "hospitalNombre",
+      "hospitalClave",
+      "categoria",
+      "fechaEnvio",
+      "clave",
+      "descripcion",
+      "stock",
+      "minimo",
+      "fecha",
+      "dias",
+      "observaciones",
+      "color",
+      "manual"
+    ];
+
+    const csvLines = [ header.join(",") ];
+    for (const r of rows) {
+      const line = header.map(h => csvEscape(r[h])).join(",");
+      csvLines.push(line);
+    }
+
+    const filename = `report_submissions_${new Date().toISOString().slice(0,19).replace(/[:T]/g,"_")}.csv`;
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    return res.send(csvLines.join("\r\n"));
+  } catch (e) {
+    console.error("Error GET /report:", e);
+    return res.status(500).json({ ok: false, error: "error generando reporte" });
   }
 });
 
