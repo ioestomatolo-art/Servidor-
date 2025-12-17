@@ -71,7 +71,7 @@ const HOSPITALES = [
   { nombre: "Hospital de la Comunidad de Coatepec", clave: "VZIM000790" },
   { nombre: "Hospital de la Comunidad de Alvarado", clave: "VZIM000254" },
   { nombre: "Hospital de la Comunidad de Cerro Azul", clave: "VZIM006180" },
-  { nombre: "Hospital de la Cumunidad de Entabladero", clave: "VZIM006163" },
+  { nombre: "Hospital de la Comunidad de Entabladero", clave: "VZIM006163" },
   { nombre: "Hospital de la Comunidad de Gutierrez Zamora", clave: "VZIM001794" },
   { nombre: "Hospital de la Comunidad de Huayacocotla", clave: "VZIM001922" },
   { nombre: "Hospital de la Comunidad de Jose Azueta", clave: "VZIM007860" },
