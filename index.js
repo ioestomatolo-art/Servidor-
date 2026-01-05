@@ -14,7 +14,7 @@ app.use(morgan("combined"));
 
 // CONFIG (ajusta según entorno)
 const API_TOKEN = process.env.API_TOKEN || ""; // si se configura, protege endpoints de escritura/reporte
-const DATABASE_URL = process.env.DATABASE_URL || "postgresql://estomatologia_user:FkscCZWC1nZ3Z7m00mpmC0ZF6j2vFd48@dpg-d5du2475r7bs73c6tcg0-a.oregon-postgres.render.com/estomatologia"; // si la pones, USE_DB será true
+const DATABASE_URL = process.env.DATABASE_URL || "postgresql://guiaestomatologia:JSw837U0n1vBAZBSUhxvCwT2vI6tAwX1@dpg-d5du2475r7bs73c6tcg0-a.oregon-postgres.render.com/estomatologia"; // si la pones, USE_DB será true
 const USE_DB = !!DATABASE_URL;
 
 // FILE STORAGE fallback
