@@ -90,7 +90,7 @@ const HOSPITALES = [
   { nombre: "Hospital General Alamo", clave: "VZIM016035" },
   { nombre: "Hospital General Altotonga Eufrosina Camacho", clave: "VZIM000230" },
   { nombre: "Hospital General Cordoba Yanga", clave: "VZIM000983" },
-  { nombre: "Hospital General Cosoamalapan Dr.Victor Manuel Pitalua Gonzales", clave: "VZIM001000" },
+  { nombre: "Hospital General Cosamaloapan Dr.Victor Manuel Pitalua Gonzales", clave: "VZIM001000" },
   { nombre: "Hospital General de Cosoloacaque", clave: "VZIM007930" },
   { nombre: "Hospital General de Boca del Rio", clave: "VZIM010212" },
   { nombre: "Hospital General de Cardel", clave: "VZIM006105" },
