@@ -9,12 +9,15 @@ const path = require("path");
 const { Pool } = require("pg");
 
 const app = express();
-app.use(express.json({ limit: "5mb" }));
+app.use(express 
+  
+  
+  .json({ limit: "5mb" }));
 app.use(morgan("combined"));
 
 // CONFIG (ajusta según entorno)
 const API_TOKEN = process.env.API_TOKEN || ""; // si se configura, protege endpoints de escritura/reporte
-const DATABASE_URL = process.env.DATABASE_URL || "postgresql://guiaestomatologia:JSw837U0n1vBAZBSUhxvCwT2vI6tAwX1@dpg-d5du2475r7bs73c6tcg0-a.oregon-postgres.render.com/estomatologia"; // si la pones, USE_DB será true
+const DATABASE_URL = process.env.DATABASE_URL || ""; // si la pones, USE_DB será true
 const USE_DB = !!DATABASE_URL;
 
 // FILE STORAGE fallback
@@ -288,8 +291,6 @@ app.get("/inventory", async (req, res) => {
 /*
   POST /inventory/item/delete
   Body: { hospitalClave, categoria, uids: ["uid1","uid2", ...] }
-  - Protegido opcionalmente por token (requireTokenIfSet).
-  - Elimina los items con esos uid del inventario más reciente para hospital+categoria.
   - Retorna { ok:true, modified: boolean, remaining: N }
 */
 app.post("/inventory/item/delete", requireTokenIfSet, async (req, res) => {
