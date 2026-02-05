@@ -17,7 +17,7 @@ app.use(morgan("combined"));
 
 // CONFIG (ajusta según entorno)
 const API_TOKEN = process.env.API_TOKEN || ""; // si se configura, protege endpoints de escritura/reporte
-const DATABASE_URL = process.env.DATABASE_URL || ""; // si la pones, USE_DB será true
+const DATABASE_URL = process.env.DATABASE_URL || "postgresql://estoma_user:tWX6Ib8kY6edtsgWqV4FE5v1TiggY8UN@dpg-d62b4evpm1nc73fqo9lg-a.oregon-postgres.render.com/estoma"; // si la pones, USE_DB será true
 const USE_DB = !!DATABASE_URL;
 
 // FILE STORAGE fallback
