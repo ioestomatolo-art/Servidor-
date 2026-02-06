@@ -230,6 +230,8 @@ app.post("/inventory", requireTokenIfSet, async (req, res) => {
       return { ...it, uid };
     });
 
+
+
     if (USE_DB) {
       await pool.query(
         `INSERT INTO inventarios (hospital_clave, hospital_nombre, categoria, items, saved_at)
@@ -345,6 +347,9 @@ app.post("/inventory/item/delete", requireTokenIfSet, async (req, res) => {
   }
 });
 
+
+// Nuevo endpoint para consultar el inventario importado desde el CSV
+ app.get("/inventory-base", async (req, res) => { try { const { hospitalClave } = req.query; if (!hospitalClave) { return res.status(400).json({ ok: false, error: "Falta hospitalClave" }); } if (USE_DB) { const { rows } = await pool.query( `SELECT clave, descripcion, stock, minimo, fecha, dias_restantes FROM inventarios_csv WHERE hospital_clave = $1 ORDER BY descripcion ASC`, [hospitalClave] ); return res.json(rows); } else { return res.status(400).json({ ok: false, error: "Base de datos no conectada" }); } } catch (e) { console.error("Error GET /inventory-base:", e); return res.status(500).json({ ok: false, error: "Error interno del servidor" }); } });
 // GET /submissions (admin)
 app.get("/submissions", async (req, res) => {
   if (API_TOKEN) {
