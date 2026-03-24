@@ -3,7 +3,7 @@ const cors = require("cors");
 const morgan = require("morgan");
 const crypto = require("crypto");
 const { Pool } = require("pg");
-const { createClient } = require("@supabase/supabase-js");
+
 
 const app = express();
 app.use(express.json({ limit: "5mb" }));
