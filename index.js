@@ -1,64 +1,127 @@
-// index.js — servidor (completo)
-// Express + fallback file storage + endpoint para borrar items por uid
 const express = require("express");
 const cors = require("cors");
 const morgan = require("morgan");
 const crypto = require("crypto");
-const fs = require("fs").promises;
-const path = require("path");
 const { Pool } = require("pg");
+const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
-app.use(express 
-  
-  
-  .json({ limit: "5mb" }));
+app.use(express.json({ limit: "5mb" }));
 app.use(morgan("combined"));
 
-// CONFIG (ajusta según entorno)
-const API_TOKEN = process.env.API_TOKEN || ""; // si se configura, protege endpoints de escritura/reporte
-const DATABASE_URL = process.env.DATABASE_URL || ""; // si la pones, USE_DB será true
-const USE_DB = !!DATABASE_URL;
+const PORT = parseInt(process.env.PORT || "3000", 10);
+const DATABASE_URL = process.env.DATABASE_URL || "postgresql://postgres:mexico28yesovas@db.gprkhjjpeaeapqragqlp.supabase.co:5432/postgres";
+const SUPABASE_URL = process.env.SUPABASE_URL || "https://gprkhjjpeaeapqragqlp.supabase.co";
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "";
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+const API_TOKEN = process.env.API_TOKEN || "";
 
-// FILE STORAGE fallback
-const DATA_DIR = path.join(__dirname, "data");
-const SUBMISSIONS_FILE = path.join(DATA_DIR, "submissions.json");
-const INVENT_DIR = path.join(DATA_DIR, "inventories");
+if (!DATABASE_URL) {
+  console.warn("DATABASE_URL no configurada.");
+}
+if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+  console.warn("SUPABASE_URL o SUPABASE_ANON_KEY no configurados.");
+}
 
-// CORS configurable vía env ALLOW_ORIGINS (coma-separados). Si no, permite cualquier origen.
-const allowOriginsEnv = (process.env.ALLOW_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean);
-const corsOptions = allowOriginsEnv.length
-  ? {
-      origin: (origin, cb) => {
-        if (!origin) return cb(null, true);
-        if (allowOriginsEnv.includes(origin)) return cb(null, true);
-        return cb(new Error("CORS origin denied"));
+const allowOriginsEnv = (process.env.ALLOW_ORIGINS || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+
+app.use(cors(
+  allowOriginsEnv.length
+    ? {
+        origin: (origin, cb) => {
+          if (!origin) return cb(null, true);
+          if (allowOriginsEnv.includes(origin)) return cb(null, true);
+          return cb(new Error("CORS origin denied"));
+        }
+      }
+    : { origin: true }
+));
+
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+const supabaseAdmin = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
+  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+      auth: { persistSession: false, autoRefreshToken: false }
+    })
+  : null;
+
+function supabaseForRequest(req) {
+  return createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+    auth: { persistSession: false, autoRefreshToken: false },
+    global: {
+      headers: {
+        Authorization: req.headers.authorization || ""
       }
     }
-  : { origin: true };
-app.use(cors(corsOptions));
-
-// ======================
-// DB POOL (si aplica)
-// ======================
-let pool = null;
-if (USE_DB) {
-  pool = new Pool({
-    connectionString: DATABASE_URL,
-    ssl: { rejectUnauthorized: false }
-  });
-
-  pool.connect().then(client => {
-    client.release();
-    console.log("Conexión a PostgreSQL OK (POOL inicializado).");
-  }).catch(err => {
-    console.warn("Advertencia: no se pudo conectar a Postgres al iniciar:", err.message || err);
   });
 }
 
-// ======================
-// HOSPITALES (lista fija)
-// ======================
+async function requireSupabaseUser(req, res, next) {
+  try {
+    const authHeader = (req.headers.authorization || "").trim();
+    if (!authHeader.toLowerCase().startsWith("bearer ")) {
+      return res.status(401).json({ ok: false, error: "Falta token de acceso" });
+    }
+
+    const supabase = supabaseForRequest(req);
+    const { data, error } = await supabase.auth.getUser();
+    if (error || !data || !data.user) {
+      return res.status(401).json({ ok: false, error: "Token inválido o expirado" });
+    }
+
+    req.supabaseUser = data.user;
+    next();
+  } catch (err) {
+    console.error("requireSupabaseUser error:", err);
+    return res.status(401).json({ ok: false, error: "No autorizado" });
+  }
+}
+
+async function requireAdmin(req, res, next) {
+  if (!API_TOKEN) return next();
+  const authHeader = (req.headers.authorization || "").trim();
+  const bodyToken = (req.body && req.body._token) ? String(req.body._token).trim() : "";
+  const tokenQuery = (req.query.token || "").trim();
+
+  const candidates = [];
+  if (authHeader.toLowerCase().startsWith("bearer ")) candidates.push(authHeader.slice(7).trim());
+  if (bodyToken) candidates.push(bodyToken);
+  if (tokenQuery) candidates.push(tokenQuery);
+
+  if (candidates.includes(API_TOKEN)) return next();
+  return res.status(401).json({ ok: false, error: "Unauthorized" });
+}
+
+async function getAppUserBySupabaseId(uid) {
+  const { rows } = await pool.query(
+    `SELECT supabase_user_id, email, full_name, hospital_clave, hospital_nombre, role, active
+     FROM app_users
+     WHERE supabase_user_id = $1
+     LIMIT 1`,
+    [uid]
+  );
+  return rows[0] || null;
+}
+
+async function ensureUserHasHospital(req, res) {
+  const user = await getAppUserBySupabaseId(req.supabaseUser.id);
+  if (!user) {
+    res.status(403).json({ ok: false, error: "Usuario sin hospital asignado" });
+    return null;
+  }
+  if (!user.active) {
+    res.status(403).json({ ok: false, error: "Usuario inactivo" });
+    return null;
+  }
+  return user;
+}
+
 const HOSPITALES = [
   { nombre: "Centro de Alta Especialidad DR.Rafael Lucio", clave: "VZIM002330" },
   { nombre: "Centro de Salud con Hospitalizacion de Alto Lucero de Gutierrez Barrios,Ver.", clave: "VZIM008065" },
@@ -121,293 +184,243 @@ const HOSPITALES = [
   { nombre: "Uneme de Platon Sanchez", clave: "VZIM015545" }
 ];
 
-// ======================
-// Helper: FILE storage (fallback)
-// ======================
-async function ensureStorage() {
-  await fs.mkdir(DATA_DIR, { recursive: true });
-  await fs.mkdir(INVENT_DIR, { recursive: true });
-  try {
-    await fs.access(SUBMISSIONS_FILE);
-  } catch (e) {
-    await fs.writeFile(SUBMISSIONS_FILE, JSON.stringify([], null, 2), "utf8");
-  }
-}
-async function readJsonSafe(filePath) {
-  try {
-    const content = await fs.readFile(filePath, "utf8");
-    return JSON.parse(content || "[]");
-  } catch (e) {
-    return null;
-  }
-}
-async function writeJsonSafe(filePath, obj) {
-  await fs.writeFile(filePath, JSON.stringify(obj, null, 2), "utf8");
-}
-function safeFileNameSegment(s) {
-  if (!s) return "unknown";
-  return String(s).replace(/[^a-z0-9\-_]/ig, "_").slice(0, 120);
-}
-
-// ======================
-// Middleware: token optional
-// ======================
-function requireTokenIfSet(req, res, next) {
-  if (!API_TOKEN) return next();
-  const authHeader = (req.headers.authorization || "").trim();
-  if (authHeader.toLowerCase().startsWith("bearer ")) {
-    const tk = authHeader.slice(7).trim();
-    if (tk === API_TOKEN) return next();
-  }
-  const bodyToken = req.body && req.body._token;
-  if (bodyToken && bodyToken === API_TOKEN) return next();
-  const tokenQuery = (req.query.token || "").trim();
-  if (tokenQuery && tokenQuery === API_TOKEN) return next();
-  return res.status(401).json({ ok: false, error: "Unauthorized: missing/invalid token" });
-}
-
-// ======================
-// ROUTES
-// ======================
-
-app.get("/health", (req, res) => res.json({ ok: true, ts: new Date().toISOString(), usingDb: USE_DB }));
+app.get("/health", (req, res) => {
+  res.json({ ok: true, ts: new Date().toISOString(), usingDb: true });
+});
 
 app.get("/hospitales", (req, res) => {
-  try {
-    const q = (req.query.q || "").trim().toLowerCase();
-    if (!q) return res.json(HOSPITALES);
-    const filtered = HOSPITALES.filter(h =>
-      (h.nombre || "").toLowerCase().includes(q) || (h.clave || "").toLowerCase().includes(q)
-    );
-    return res.json(filtered);
-  } catch (e) {
-    console.error("Error /hospitales:", e);
-    return res.status(500).json({ ok: false, error: "error interno" });
-  }
+  const q = (req.query.q || "").trim().toLowerCase();
+  if (!q) return res.json(HOSPITALES);
+  const filtered = HOSPITALES.filter(h =>
+    (h.nombre || "").toLowerCase().includes(q) || (h.clave || "").toLowerCase().includes(q)
+  );
+  return res.json(filtered);
 });
 
-// POST /submit -> guarda envíos históricos (DB o file)
-app.post("/submit", requireTokenIfSet, async (req, res) => {
+app.get("/me", requireSupabaseUser, async (req, res) => {
   try {
-    const payload = req.body;
-    if (!payload || typeof payload !== "object") return res.status(400).json({ ok: false, error: "payload inválido" });
-
-    const id = (crypto.randomUUID ? crypto.randomUUID() : (Date.now() + "-" + Math.floor(Math.random() * 10000)));
-    const receivedAt = new Date().toISOString();
-
-    if (USE_DB) {
-      await pool.query(
-        `INSERT INTO submissions (id, payload, received_at)
-         VALUES ($1, $2::json, $3)`,
-        [id, JSON.stringify(payload), receivedAt]
-      );
-      return res.json({ ok: true, id, savedAt: receivedAt });
-    } else {
-      await ensureStorage();
-      const existing = (await readJsonSafe(SUBMISSIONS_FILE)) || [];
-      const submission = { id, ...payload, receivedAt };
-      existing.push(submission);
-      await writeJsonSafe(SUBMISSIONS_FILE, existing);
-      return res.json({ ok: true, id, savedAt: receivedAt });
+    const appUser = await getAppUserBySupabaseId(req.supabaseUser.id);
+    if (!appUser) {
+      return res.status(403).json({
+        ok: false,
+        error: "Usuario autenticado pero sin hospital asignado"
+      });
     }
+    return res.json({
+      ok: true,
+      user: {
+        id: req.supabaseUser.id,
+        email: req.supabaseUser.email || appUser.email || "",
+        hospital_clave: appUser.hospital_clave,
+        hospital_nombre: appUser.hospital_nombre,
+        full_name: appUser.full_name || "",
+        role: appUser.role || "encargado"
+      }
+    });
   } catch (e) {
-    console.error("Error /submit:", e);
-    return res.status(500).json({ ok: false, error: "error guardando submission" });
+    console.error("Error /me:", e);
+    return res.status(500).json({ ok: false, error: "error obteniendo perfil" });
   }
 });
 
-// POST /inventory -> guarda inventario para hospital+categoria (DB or file)
-// Además: asegura que cada item tenga uid (si no lo trae) antes de persistir.
-app.post("/inventory", requireTokenIfSet, async (req, res) => {
+app.post("/admin/invite-user", requireAdmin, async (req, res) => {
   try {
-    const { hospitalClave, hospitalNombre, categoria, items } = req.body || {};
-    if (!categoria || !items || !Array.isArray(items)) return res.status(400).json({ ok: false, error: "falta categoria o items" });
+    if (!supabaseAdmin) {
+      return res.status(500).json({ ok: false, error: "Supabase admin no configurado" });
+    }
 
-    // asignar uid a items que no lo tengan
-    const itemsWithUid = items.map(it => {
-      if (it && it.uid) return it;
-      const uid = (crypto.randomUUID ? crypto.randomUUID() : (`uid-${Date.now()}-${Math.random().toString(36).slice(2,8)}`));
-      return { ...it, uid };
+    const { email, full_name, hospital_clave, hospital_nombre, role } = req.body || {};
+    if (!email || !hospital_clave || !hospital_nombre) {
+      return res.status(400).json({ ok: false, error: "faltan email, hospital_clave o hospital_nombre" });
+    }
+
+    const { data, error } = await supabaseAdmin.auth.admin.inviteUserByEmail(email, {
+      data: {
+        full_name: full_name || "",
+        hospital_clave,
+        hospital_nombre,
+        role: role || "encargado"
+      }
     });
 
-
-
-    if (USE_DB) {
-      await pool.query(
-        `INSERT INTO inventarios (hospital_clave, hospital_nombre, categoria, items, saved_at)
-         VALUES ($1, $2, $3, $4::json, $5)`,
-        [hospitalClave || "", hospitalNombre || "", categoria, JSON.stringify(itemsWithUid), new Date().toISOString()]
-      );
-      return res.json({ ok: true, savedAt: new Date().toISOString() });
-    } else {
-      const key = (hospitalClave && hospitalClave.trim()) || (hospitalNombre && hospitalNombre.trim()) || `unknown-${Date.now()}`;
-      const fileName = `${safeFileNameSegment(key)}--${safeFileNameSegment(categoria)}.json`;
-      const filePath = path.join(INVENT_DIR, fileName);
-      const payload = {
-        savedAt: new Date().toISOString(),
-        hospitalClave: hospitalClave || "",
-        hospitalNombre: hospitalNombre || "",
-        categoria,
-        items: itemsWithUid
-      };
-      await ensureStorage();
-      await writeJsonSafe(filePath, payload);
-      return res.json({ ok: true, savedAt: payload.savedAt, file: fileName });
+    if (error) {
+      return res.status(500).json({ ok: false, error: error.message });
     }
+
+    const userId = data && data.user && data.user.id ? data.user.id : null;
+    if (!userId) {
+      return res.status(500).json({ ok: false, error: "No se recibió el id del usuario invitado" });
+    }
+
+    await pool.query(
+      `INSERT INTO app_users (supabase_user_id, email, full_name, hospital_clave, hospital_nombre, role, active)
+       VALUES ($1, $2, $3, $4, $5, $6, TRUE)
+       ON CONFLICT (supabase_user_id)
+       DO UPDATE SET email = EXCLUDED.email,
+                     full_name = EXCLUDED.full_name,
+                     hospital_clave = EXCLUDED.hospital_clave,
+                     hospital_nombre = EXCLUDED.hospital_nombre,
+                     role = EXCLUDED.role,
+                     active = TRUE`,
+      [userId, email, full_name || "", hospital_clave, hospital_nombre, role || "encargado"]
+    );
+
+    return res.json({ ok: true, userId });
   } catch (e) {
-    console.error("Error POST /inventory:", e);
-    return res.status(500).json({ ok: false, error: "error guardando inventory" });
+    console.error("Error invitando usuario:", e);
+    return res.status(500).json({ ok: false, error: "error invitando usuario" });
   }
 });
 
-// GET /inventory?hospitalClave=...&categoria=...
-app.get("/inventory", async (req, res) => {
+app.get("/inventory-base", requireSupabaseUser, async (req, res) => {
   try {
-    const hospitalClave = (req.query.hospitalClave || req.query.hospitalNombre || "").trim();
-    const categoria = (req.query.categoria || "").trim();
-    if (!hospitalClave || !categoria) return res.json([]);
+    const appUser = await ensureUserHasHospital(req, res);
+    if (!appUser) return;
 
-    if (USE_DB) {
-      const { rows } = await pool.query(
-        `SELECT id, hospital_clave, hospital_nombre, categoria, items, saved_at
-         FROM inventarios
-         WHERE hospital_clave = $1 AND categoria = $2
-         ORDER BY id DESC
-         LIMIT 1`,
-        [hospitalClave, categoria]
-      );
-      return res.json(rows[0] || {});
-    } else {
-      const fileName = `${safeFileNameSegment(hospitalClave)}--${safeFileNameSegment(categoria)}.json`;
-      const filePath = path.join(INVENT_DIR, fileName);
-      const data = await readJsonSafe(filePath);
-      if (data === null) return res.json([]);
-      return res.json(data);
-    }
+    const categoria = (req.query.categoria || "").trim();
+    if (!categoria) return res.json([]);
+
+    const { rows } = await pool.query(
+      `SELECT clave, descripcion, stock, minimo, fecha, dias_restantes, categoria
+       FROM inventarios_csv
+       WHERE hospital_clave = $1 AND categoria = $2
+       ORDER BY descripcion ASC`,
+      [appUser.hospital_clave, categoria]
+    );
+    return res.json(rows || []);
+  } catch (e) {
+    console.error("Error GET /inventory-base:", e);
+    return res.status(500).json({ ok: false, error: "Error interno del servidor" });
+  }
+});
+
+app.get("/inventory", requireSupabaseUser, async (req, res) => {
+  try {
+    const appUser = await ensureUserHasHospital(req, res);
+    if (!appUser) return;
+
+    const categoria = (req.query.categoria || "").trim();
+    if (!categoria) return res.json([]);
+
+    const { rows } = await pool.query(
+      `SELECT id, hospital_clave, hospital_nombre, categoria, items, saved_at
+       FROM inventarios
+       WHERE hospital_clave = $1 AND categoria = $2
+       ORDER BY id DESC
+       LIMIT 1`,
+      [appUser.hospital_clave, categoria]
+    );
+
+    return res.json(rows[0] || {});
   } catch (e) {
     console.error("Error GET /inventory:", e);
     return res.status(500).json({ ok: false, error: "error leyendo inventory" });
   }
 });
 
-/*
-  POST /inventory/item/delete
-  Body: { hospitalClave, categoria, uids: ["uid1","uid2", ...] }
-  - Retorna { ok:true, modified: boolean, remaining: N }
-*/
-app.post("/inventory/item/delete", requireTokenIfSet, async (req, res) => {
+app.post("/inventory", requireSupabaseUser, async (req, res) => {
   try {
-    const { hospitalClave, categoria, uids } = req.body || {};
-    if (!hospitalClave || !categoria || !Array.isArray(uids) || uids.length === 0) {
-      return res.status(400).json({ ok: false, error: "falta hospitalClave, categoria o uids" });
+    const appUser = await ensureUserHasHospital(req, res);
+    if (!appUser) return;
+
+    const { categoria, items } = req.body || {};
+    if (!categoria || !Array.isArray(items)) {
+      return res.status(400).json({ ok: false, error: "falta categoria o items" });
     }
 
-    if (USE_DB) {
-      const { rows } = await pool.query(
-        `SELECT id, items FROM inventarios WHERE hospital_clave = $1 AND categoria = $2 ORDER BY id DESC LIMIT 1`,
-        [hospitalClave, categoria]
-      );
-      if (!rows || !rows.length) return res.status(404).json({ ok: false, error: "no inventory found" });
+    const itemsWithUid = items.map(it => {
+      if (it && it.uid) return it;
+      const uid = crypto.randomUUID ? crypto.randomUUID() : `uid-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      return { ...it, uid };
+    });
 
-      let items = rows[0].items;
-      if (!Array.isArray(items)) {
-        try { items = JSON.parse(items); } catch(e) { items = Array.isArray(items) ? items : []; }
-      }
+    const payload = {
+      hospital_clave: appUser.hospital_clave,
+      hospital_nombre: appUser.hospital_nombre,
+      categoria,
+      items: itemsWithUid
+    };
 
-      const before = items.length;
-      const setUids = new Set(uids.map(String));
-      const filtered = items.filter(it => !setUids.has(String(it && it.uid)));
+    await pool.query(
+      `INSERT INTO inventarios (hospital_clave, hospital_nombre, categoria, items, saved_at)
+       VALUES ($1, $2, $3, $4::jsonb, NOW())`,
+      [payload.hospital_clave, payload.hospital_nombre, payload.categoria, JSON.stringify(payload.items)]
+    );
 
-      if (filtered.length === before) {
-        return res.json({ ok: true, modified: false, remaining: filtered.length });
-      }
+    return res.json({ ok: true, savedAt: new Date().toISOString() });
+  } catch (e) {
+    console.error("Error POST /inventory:", e);
+    return res.status(500).json({ ok: false, error: "error guardando inventory" });
+  }
+});
 
-      await pool.query(
-        `UPDATE inventarios SET items = $1::json WHERE id = $2`,
-        [JSON.stringify(filtered), rows[0].id]
-      );
+app.post("/inventory/item/delete", requireSupabaseUser, async (req, res) => {
+  try {
+    const appUser = await ensureUserHasHospital(req, res);
+    if (!appUser) return;
 
-      return res.json({ ok: true, modified: true, remaining: filtered.length });
-    } else {
-      const key = hospitalClave;
-      const fileName = `${safeFileNameSegment(key)}--${safeFileNameSegment(categoria)}.json`;
-      const filePath = path.join(INVENT_DIR, fileName);
-      const data = await readJsonSafe(filePath);
-      if (!data || !Array.isArray(data.items)) return res.status(404).json({ ok: false, error: "no inventory file found" });
-      const before = data.items.length;
-      const setUids = new Set(uids.map(String));
-      data.items = data.items.filter(it => !setUids.has(String(it && it.uid)));
-      await writeJsonSafe(filePath, data);
-      const modified = data.items.length !== before;
-      return res.json({ ok: true, modified, remaining: data.items.length });
+    const { categoria, uids } = req.body || {};
+    if (!categoria || !Array.isArray(uids) || uids.length === 0) {
+      return res.status(400).json({ ok: false, error: "falta categoria o uids" });
     }
+
+    const { rows } = await pool.query(
+      `SELECT id, items
+       FROM inventarios
+       WHERE hospital_clave = $1 AND categoria = $2
+       ORDER BY id DESC
+       LIMIT 1`,
+      [appUser.hospital_clave, categoria]
+    );
+    if (!rows.length) {
+      return res.status(404).json({ ok: false, error: "no inventory found" });
+    }
+
+    let items = rows[0].items;
+    if (!Array.isArray(items)) {
+      try { items = JSON.parse(items); } catch (_) { items = []; }
+    }
+
+    const setUids = new Set(uids.map(String));
+    const filtered = items.filter(it => !setUids.has(String(it && it.uid)));
+
+    await pool.query(
+      `UPDATE inventarios SET items = $1::jsonb WHERE id = $2`,
+      [JSON.stringify(filtered), rows[0].id]
+    );
+
+    return res.json({ ok: true, modified: true, remaining: filtered.length });
   } catch (e) {
     console.error("Error POST /inventory/item/delete:", e);
     return res.status(500).json({ ok: false, error: "error eliminando items" });
   }
 });
 
-
-// Nuevo endpoint para consultar el inventario importado desde el CSV
- app.get("/inventory-base", async (req, res) => { try { const { hospitalClave } = req.query; if (!hospitalClave) { return res.status(400).json({ ok: false, error: "Falta hospitalClave" }); } if (USE_DB) { const { rows } = await pool.query( `SELECT clave, descripcion, stock, minimo, fecha, dias_restantes FROM inventarios_csv WHERE hospital_clave = $1 ORDER BY descripcion ASC`, [hospitalClave] ); return res.json(rows); } else { return res.status(400).json({ ok: false, error: "Base de datos no conectada" }); } } catch (e) { console.error("Error GET /inventory-base:", e); return res.status(500).json({ ok: false, error: "Error interno del servidor" }); } });
-// GET /submissions (admin)
-app.get("/submissions", async (req, res) => {
-  if (API_TOKEN) {
-    const authHeader = (req.headers.authorization || "").trim();
-    const tokenQuery = (req.query.token || "").trim();
-    let ok = false;
-    if (authHeader.toLowerCase().startsWith("bearer ")) ok = authHeader.slice(7).trim() === API_TOKEN;
-    if (!ok && tokenQuery) ok = tokenQuery === API_TOKEN;
-    if (!ok) return res.status(401).json({ ok: false, error: "Unauthorized" });
-  }
-
+app.get("/submissions", requireAdmin, async (req, res) => {
   try {
-    if (USE_DB) {
-      const { rows } = await pool.query(`SELECT id, payload, received_at FROM submissions ORDER BY received_at DESC`);
-      const normalized = rows.map(r => {
-        let payload = r.payload;
-        try { if (typeof payload === "string") payload = JSON.parse(payload); } catch(e){}
-        return { id: r.id, ...payload, receivedAt: r.received_at || payload.receivedAt };
-      });
-      return res.json(normalized);
-    } else {
-      await ensureStorage();
-      const existing = (await readJsonSafe(SUBMISSIONS_FILE)) || [];
-      existing.sort((a,b) => {
-        const ta = a.receivedAt || a.fechaEnvio || "";
-        const tb = b.receivedAt || b.fechaEnvio || "";
-        return tb.localeCompare(ta);
-      });
-      return res.json(existing);
-    }
+    const { rows } = await pool.query(`SELECT id, payload, received_at FROM submissions ORDER BY received_at DESC`);
+    const normalized = rows.map(r => ({
+      id: r.id,
+      ...(typeof r.payload === "string" ? JSON.parse(r.payload) : (r.payload || {})),
+      receivedAt: r.received_at
+    }));
+    return res.json(normalized);
   } catch (e) {
     console.error("Error GET /submissions:", e);
     return res.status(500).json({ ok: false, error: "error leyendo submissions" });
   }
 });
 
-// START
-const PORT = parseInt(process.env.PORT || "3000", 10);
-
 (async () => {
   try {
-    if (!USE_DB) {
-      await ensureStorage();
-      console.log("Modo FILE (fallback). Archivos en:", DATA_DIR);
-    } else {
-      console.log("Modo DB: usando PostgreSQL (DATABASE_URL detectado).");
-    }
-
+    await pool.connect().then(c => c.release());
+    console.log("Conexión a PostgreSQL OK.");
     app.listen(PORT, () => {
-      console.log(`Servidor iniciado en puerto ${PORT} (PID:${process.pid}) - usingDb=${USE_DB}`);
-      if (API_TOKEN) console.log("API_TOKEN está configurado (endpoints protegidos).");
+      console.log(`Servidor iniciado en puerto ${PORT} (PID:${process.pid})`);
+      if (API_TOKEN) console.log("API_TOKEN configurado para endpoints admin.");
     });
   } catch (err) {
     console.error("No se pudo iniciar el servidor:", err);
     process.exit(1);
   }
 })();
-
-
-
-
