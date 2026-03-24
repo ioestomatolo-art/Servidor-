@@ -351,6 +351,14 @@ app.post("/inventory/item/delete", requireTokenIfSet, async (req, res) => {
 // Nuevo endpoint para consultar el inventario importado desde el CSV
 // Nuevo endpoint para consultar el inventario importado desde el CSV (CORREGIDO)
 app.get("/inventory-base", async (req, res) => {
+  // En index.js, dentro de app.get("/inventory-base", ...)
+const { rows } = await pool.query(
+  `SELECT categoria, clave, descripcion, stock, minimo, fecha, dias_restantes 
+   FROM inventarios_csv 
+   WHERE hospital_clave = $1 OR hospital_nombre = $1 
+   ORDER BY descripcion ASC`,
+  [hospitalClave] // Aquí "hospitalClave" actuará como comodín para ambos
+);
   try {
     const { hospitalClave } = req.query;
     if (!hospitalClave) {
