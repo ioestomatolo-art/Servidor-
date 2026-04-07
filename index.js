@@ -412,7 +412,14 @@ app.get("/inventory-base", async (req, res) => {
     }
 
     const { rows } = await pool.query(
-      `SELECT categoria, clave, descripcion, stock, minimo, fecha, dias_restantes
+      `SELECT
+         LOWER(TRIM(categoria)) AS categoria,
+         clave,
+         descripcion,
+         stock,
+         minimo,
+         fecha,
+         dias_restantes
        FROM inventarios_csv
        WHERE hospital_clave = $1
        ORDER BY descripcion ASC`,
