@@ -294,36 +294,36 @@ app.post("/inventory", requireTokenIfSet, async (req, res) => {
   }
 });
 
-app.get("/inventory", async (req, res) => {
+app.get("/inventory-base", async (req, res) => {
   try {
-    const hospitalClave = (req.query.hospitalClave || req.query.hospitalNombre || "").trim();
-    const categoria = (req.query.categoria || "").trim();
+    const hospitalClave = (req.query.hospitalClave || "").trim();
+    const hospitalNombre = (req.query.hospitalNombre || "").trim();
 
-    if (!hospitalClave || !categoria) return res.json([]);
-
-    if (USE_DB) {
-      const { rows } = await pool.query(
-        `SELECT id, hospital_clave, hospital_nombre, categoria, items, saved_at
-         FROM inventarios
-         WHERE hospital_clave = $1 AND categoria = $2
-         ORDER BY id DESC
-         LIMIT 1`,
-        [hospitalClave, categoria]
-      );
-      return res.json(rows[0] || {});
+    const lookup = hospitalClave || hospitalNombre;
+    if (!lookup) {
+      return res.status(400).json({ ok: false, error: "Falta hospitalClave o hospitalNombre" });
     }
 
-    const fileName = `${safeFileNameSegment(hospitalClave)}--${safeFileNameSegment(categoria)}.json`;
-    const filePath = path.join(INVENT_DIR, fileName);
-    const data = await readJsonSafe(filePath);
+    if (!USE_DB) {
+      return res.status(400).json({ ok: false, error: "Base de datos no conectada" });
+    }
 
-    if (data === null) return res.json([]);
-    return res.json(data);
+    const { rows } = await pool.query(
+      `SELECT categoria, clave, descripcion, stock, minimo, fecha, dias_restantes
+       FROM inventarios_csv
+       WHERE TRIM(LOWER(hospital_clave)) = TRIM(LOWER($1))
+          OR TRIM(LOWER(hospital_nombre)) = TRIM(LOWER($1))
+       ORDER BY descripcion ASC`,
+      [lookup]
+    );
+
+    return res.json(rows);
   } catch (e) {
-    console.error("Error GET /inventory:", e);
-    return res.status(500).json({ ok: false, error: "error leyendo inventory" });
+    console.error("Error GET /inventory-base:", e);
+    return res.status(500).json({ ok: false, error: "Error interno del servidor" });
   }
 });
+
 
 app.post("/inventory/item/delete", requireTokenIfSet, async (req, res) => {
   try {
