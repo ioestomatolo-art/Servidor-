@@ -346,12 +346,16 @@ app.post("/inventory/item/delete", requireTokenIfSet, async (req, res) => {
          WHERE hospital_clave = $1 AND categoria = $2
          ORDER BY id DESC
          LIMIT 1`,
-        [hospitalClave, categoria]
+        [hospitalClave, categoria, uids]
       );
 
       if (!rows || !rows.length) {
         return res.status(404).json({ ok: false, error: "no inventory found" });
       }
+
+
+      
+
 
       let items = rows[0].items;
       if (!Array.isArray(items)) {
