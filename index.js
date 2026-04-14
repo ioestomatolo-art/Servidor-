@@ -346,7 +346,7 @@ app.post("/inventory/item/delete", requireTokenIfSet, async (req, res) => {
          WHERE hospital_clave = $1 AND categoria = $2
          ORDER BY id DESC
          LIMIT 1`,
-        [hospitalClave, categoria, uids]
+        [hospitalClave, categoria]
       );
 
       if (!rows || !rows.length) {
