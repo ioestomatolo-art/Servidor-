@@ -1,4 +1,4 @@
-// index.js — servidor completo y corregido
+// index.js — servidor completo con compatibilidad dual
 const express = require("express");
 const cors = require("cors");
 const morgan = require("morgan");
@@ -60,15 +60,6 @@ if (USE_DB) {
     connectionString: DATABASE_URL,
     ssl: { rejectUnauthorized: false }
   });
-
-  pool.connect()
-    .then(client => {
-      client.release();
-      console.log("Conexión a PostgreSQL OK (POOL inicializado).");
-    })
-    .catch(err => {
-      console.warn("Advertencia: no se pudo conectar a Postgres al iniciar:", err.message || err);
-    });
 }
 
 // ======================
@@ -169,6 +160,43 @@ function safeFileNameSegment(s) {
 }
 
 // ======================
+// DB SCHEMA
+// ======================
+async function ensureDbSchema() {
+  if (!USE_DB) return;
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS inventarios_items (
+      id SERIAL PRIMARY KEY,
+      hospital_clave TEXT NOT NULL,
+      hospital_nombre TEXT NOT NULL,
+      categoria TEXT NOT NULL,
+      uid TEXT NOT NULL,
+      clave TEXT NOT NULL,
+      descripcion TEXT,
+      stock INT,
+      minimo INT,
+      fecha DATE,
+      dias_restantes INT,
+      observaciones TEXT,
+      color TEXT,
+      manual BOOLEAN DEFAULT FALSE,
+      saved_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_inventarios_items_hosp_cat
+    ON inventarios_items (hospital_clave, categoria);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_inventarios_items_uid
+    ON inventarios_items (hospital_clave, categoria, uid);
+  `);
+}
+
+// ======================
 // TOKEN OPTIONAL
 // ======================
 function requireTokenIfSet(req, res, next) {
@@ -187,6 +215,42 @@ function requireTokenIfSet(req, res, next) {
   if (tokenQuery && tokenQuery === API_TOKEN) return next();
 
   return res.status(401).json({ ok: false, error: "Unauthorized: missing/invalid token" });
+}
+
+// ======================
+// NORMALIZERS
+// ======================
+function normalizeInventoryRow(row = {}) {
+  return {
+    uid: String(row.uid || "").trim(),
+    clave: String(row.clave || "").trim(),
+    descripcion: row.descripcion || "",
+    stock: row.stock !== null && row.stock !== undefined ? String(row.stock) : "",
+    minimo: row.minimo !== null && row.minimo !== undefined ? String(row.minimo) : "",
+    fecha: row.fecha ? String(row.fecha).slice(0, 10) : "",
+    dias: row.dias !== null && row.dias !== undefined
+      ? String(row.dias)
+      : (row.dias_restantes !== null && row.dias_restantes !== undefined ? String(row.dias_restantes) : ""),
+    observaciones: row.observaciones || "",
+    color: row.color || "",
+    manual: !!row.manual
+  };
+}
+
+function normalizeLegacyItem(item = {}) {
+  return normalizeInventoryRow({
+    uid: item.uid,
+    clave: item.clave,
+    descripcion: item.descripcion,
+    stock: item.stock,
+    minimo: item.minimo,
+    fecha: item.fecha,
+    dias: item.dias,
+    dias_restantes: item.dias_restantes,
+    observaciones: item.observaciones,
+    color: item.color,
+    manual: item.manual
+  });
 }
 
 // ======================
@@ -244,6 +308,7 @@ app.post("/submit", requireTokenIfSet, async (req, res) => {
   }
 });
 
+// POST /inventory -> guarda en ambas estructuras
 app.post("/inventory", requireTokenIfSet, async (req, res) => {
   try {
     const { hospitalClave, hospitalNombre, categoria, items } = req.body || {};
@@ -261,12 +326,56 @@ app.post("/inventory", requireTokenIfSet, async (req, res) => {
     });
 
     if (USE_DB) {
-      await pool.query(
-        `INSERT INTO inventarios (hospital_clave, hospital_nombre, categoria, items, saved_at)
-         VALUES ($1, $2, $3, $4::jsonb, $5)`,
-        [hospitalClave || "", hospitalNombre || "", categoria, JSON.stringify(itemsWithUid), new Date().toISOString()]
-      );
-      return res.json({ ok: true, savedAt: new Date().toISOString() });
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+
+        // Tabla nueva: inventarios_items
+        await client.query(
+          `DELETE FROM inventarios_items
+           WHERE hospital_clave = $1 AND categoria = $2`,
+          [hospitalClave || "", categoria]
+        );
+
+        for (const it of itemsWithUid) {
+          await client.query(
+            `INSERT INTO inventarios_items
+             (hospital_clave, hospital_nombre, categoria, uid, clave, descripcion, stock, minimo, fecha, dias_restantes, observaciones, color, manual, saved_at)
+             VALUES
+             ($1, $2, $3, $4, $5, $6, NULLIF($7,'')::int, NULLIF($8,'')::int, NULLIF($9,'')::date, NULLIF($10,'')::int, $11, $12, $13, NOW())`,
+            [
+              hospitalClave || "",
+              hospitalNombre || "",
+              categoria || "",
+              it.uid || "",
+              it.clave || "",
+              it.descripcion || "",
+              it.stock || "",
+              it.minimo || "",
+              it.fecha || "",
+              it.dias || "",
+              it.observaciones || "",
+              it.color || "",
+              !!it.manual
+            ]
+          );
+        }
+
+        // Tabla vieja: inventarios (snapshot JSONB)
+        await client.query(
+          `INSERT INTO inventarios (hospital_clave, hospital_nombre, categoria, items, saved_at)
+           VALUES ($1, $2, $3, $4::jsonb, NOW())`,
+          [hospitalClave || "", hospitalNombre || "", categoria, JSON.stringify(itemsWithUid)]
+        );
+
+        await client.query("COMMIT");
+        return res.json({ ok: true, savedAt: new Date().toISOString() });
+      } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+      } finally {
+        client.release();
+      }
     }
 
     const key = (hospitalClave && hospitalClave.trim()) ||
@@ -294,7 +403,7 @@ app.post("/inventory", requireTokenIfSet, async (req, res) => {
   }
 });
 
-
+// GET /inventory -> lee ambas (nueva primero, luego vieja)
 app.get("/inventory", async (req, res) => {
   try {
     const hospitalClave = (req.query.hospitalClave || req.query.hospitalNombre || "").trim();
@@ -305,7 +414,21 @@ app.get("/inventory", async (req, res) => {
     }
 
     if (USE_DB) {
-      const { rows } = await pool.query(
+      // 1) Tabla nueva
+      const newData = await pool.query(
+        `SELECT uid, clave, descripcion, stock, minimo, fecha, dias_restantes, observaciones, color, manual
+         FROM inventarios_items
+         WHERE hospital_clave = $1 AND categoria = $2
+         ORDER BY id ASC`,
+        [hospitalClave, categoria]
+      );
+
+      if (newData.rows && newData.rows.length > 0) {
+        return res.json(newData.rows.map(normalizeInventoryRow));
+      }
+
+      // 2) Tabla vieja
+      const oldData = await pool.query(
         `SELECT id, hospital_clave, hospital_nombre, categoria, items, saved_at
          FROM inventarios
          WHERE hospital_clave = $1 AND categoria = $2
@@ -314,23 +437,33 @@ app.get("/inventory", async (req, res) => {
         [hospitalClave, categoria]
       );
 
-      return res.json(rows[0] || {});
+      if (!oldData.rows || !oldData.rows.length) {
+        return res.json([]);
+      }
+
+      let items = oldData.rows[0].items;
+      if (!Array.isArray(items)) {
+        try {
+          items = JSON.parse(items);
+        } catch {
+          items = [];
+        }
+      }
+
+      return res.json(items.map(normalizeLegacyItem));
     }
 
     const fileName = `${safeFileNameSegment(hospitalClave)}--${safeFileNameSegment(categoria)}.json`;
     const filePath = path.join(INVENT_DIR, fileName);
     const data = await readJsonSafe(filePath);
-
-    return res.json(data || {});
+    return res.json((data && Array.isArray(data.items)) ? data.items.map(normalizeLegacyItem) : []);
   } catch (e) {
     console.error("Error GET /inventory:", e);
     return res.status(500).json({ ok: false, error: "error leyendo inventory" });
   }
 });
 
-
-
-
+// DELETE/REMOVE selected items -> borra en ambas estructuras
 app.post("/inventory/item/delete", requireTokenIfSet, async (req, res) => {
   try {
     const { hospitalClave, categoria, uids } = req.body || {};
@@ -340,46 +473,55 @@ app.post("/inventory/item/delete", requireTokenIfSet, async (req, res) => {
     }
 
     if (USE_DB) {
-      const { rows } = await pool.query(
-        `SELECT id, items
-         FROM inventarios
-         WHERE hospital_clave = $1 AND categoria = $2
-         ORDER BY id DESC
-         LIMIT 1`,
-        [hospitalClave, categoria]
-      );
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
 
-      if (!rows || !rows.length) {
-        return res.status(404).json({ ok: false, error: "no inventory found" });
-      }
+        // borrar de tabla nueva
+        await client.query(
+          `DELETE FROM inventarios_items
+           WHERE hospital_clave = $1 AND categoria = $2
+             AND uid = ANY($3::text[])`,
+          [hospitalClave, categoria, uids]
+        );
 
+        // actualizar snapshot vieja
+        const old = await client.query(
+          `SELECT id, items
+           FROM inventarios
+           WHERE hospital_clave = $1 AND categoria = $2
+           ORDER BY id DESC
+           LIMIT 1`,
+          [hospitalClave, categoria]
+        );
 
-      
+        if (old.rows.length) {
+          let items = old.rows[0].items;
+          if (!Array.isArray(items)) {
+            try {
+              items = JSON.parse(items);
+            } catch {
+              items = [];
+            }
+          }
 
+          const setUids = new Set(uids.map(String));
+          const filtered = items.filter(it => !setUids.has(String(it && it.uid)));
 
-      let items = rows[0].items;
-      if (!Array.isArray(items)) {
-        try {
-          items = JSON.parse(items);
-        } catch {
-          items = [];
+          await client.query(
+            `UPDATE inventarios SET items = $1::jsonb WHERE id = $2`,
+            [JSON.stringify(filtered), old.rows[0].id]
+          );
         }
+
+        await client.query("COMMIT");
+        return res.json({ ok: true, modified: true });
+      } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+      } finally {
+        client.release();
       }
-
-      const before = items.length;
-      const setUids = new Set(uids.map(String));
-      const filtered = items.filter(it => !setUids.has(String(it && it.uid)));
-
-      if (filtered.length === before) {
-        return res.json({ ok: true, modified: false, remaining: filtered.length });
-      }
-
-      await pool.query(
-        `UPDATE inventarios SET items = $1::jsonb WHERE id = $2`,
-        [JSON.stringify(filtered), rows[0].id]
-      );
-
-      return res.json({ ok: true, modified: true, remaining: filtered.length });
     }
 
     const fileName = `${safeFileNameSegment(hospitalClave)}--${safeFileNameSegment(categoria)}.json`;
@@ -425,7 +567,8 @@ app.get("/inventory-base", async (req, res) => {
          fecha,
          dias_restantes
        FROM inventarios_csv
-       WHERE hospital_clave = $1
+       WHERE TRIM(LOWER(hospital_clave)) = TRIM(LOWER($1))
+          OR TRIM(LOWER(hospital_nombre)) = TRIM(LOWER($1))
        ORDER BY descripcion ASC`,
       [hospitalClave]
     );
@@ -500,6 +643,7 @@ const PORT = parseInt(process.env.PORT || "3000", 10);
       await ensureStorage();
       console.log("Modo FILE (fallback). Archivos en:", DATA_DIR);
     } else {
+      await ensureDbSchema();
       console.log("Modo DB: usando PostgreSQL (DATABASE_URL detectado).");
     }
 
