@@ -329,7 +329,7 @@ app.post("/inventory", requireTokenIfSet, async (req, res) => {
       await client.query("BEGIN");
 
       await client.query(
-        `DELETE FROM ${INVENTORY_TABLE}
+        `DELETE FROM inventarios_csv
          WHERE hospital_clave = $1 AND categoria = $2`,
         [hospitalClave, categoria]
       );
@@ -338,15 +338,15 @@ app.post("/inventory", requireTokenIfSet, async (req, res) => {
         const uid = String(it?.uid || "").trim() || (crypto.randomUUID ? crypto.randomUUID() : `uid-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
 
         await client.query(
-          `INSERT INTO ${INVENTORY_TABLE}
-           (hospital_clave, hospital_nombre, categoria, uid, clave, descripcion, stock, minimo, fecha, dias_restantes, observaciones, color, manual, saved_at)
+          `INSERT INTO inventarios_csv
+           (hospital_clave, hospital_nombre, categoria, uid, clave, descripcion, stock, minimo, fecha, dias_restantes, observaciones, color, manual)
            VALUES
            ($1, $2, $3, $4, $5, $6,
             NULLIF($7, '')::int,
             NULLIF($8, '')::int,
             $9,
             NULLIF($10, '')::int,
-            $11, $12, $13, NOW())`,
+            $11, $12, $13)`,
           [
             hospitalClave || "",
             hospitalNombre || "",
@@ -369,6 +369,7 @@ app.post("/inventory", requireTokenIfSet, async (req, res) => {
       return res.json({ ok: true, savedAt: new Date().toISOString() });
     } catch (err) {
       await client.query("ROLLBACK");
+      console.error("ERROR REAL POST /inventory:", err);
       throw err;
     } finally {
       client.release();
@@ -378,7 +379,6 @@ app.post("/inventory", requireTokenIfSet, async (req, res) => {
     return res.status(500).json({ ok: false, error: "error guardando inventory" });
   }
 });
-
 app.get("/inventory", async (req, res) => {
   try {
     const hospitalClave = (req.query.hospitalClave || req.query.hospitalNombre || "").trim();
