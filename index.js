@@ -304,30 +304,37 @@ app.get("/inventory", async (req, res) => {
       return res.json([]);
     }
 
-    if (USE_DB) {
-      const { rows } = await pool.query(
-        `SELECT id, hospital_clave, hospital_nombre, categoria, items, saved_at
-         FROM inventarios
-         WHERE hospital_clave = $1 AND categoria = $2
-         ORDER BY id DESC
-         LIMIT 1`,
-        [hospitalClave, categoria]
-      );
-
-      return res.json(rows[0] || {});
+    if (!USE_DB) {
+      return res.status(400).json({ ok: false, error: "Base de datos no conectada" });
     }
 
-    const fileName = `${safeFileNameSegment(hospitalClave)}--${safeFileNameSegment(categoria)}.json`;
-    const filePath = path.join(INVENT_DIR, fileName);
-    const data = await readJsonSafe(filePath);
+    const { rows } = await pool.query(
+      `SELECT
+         hospital_clave,
+         hospital_nombre,
+         categoria,
+         clave,
+         descripcion,
+         stock,
+         minimo,
+         fecha,
+         dias_restantes,
+         observaciones,
+         color,
+         manual,
+         uid
+       FROM inventarios_csv
+       WHERE hospital_clave = $1 AND categoria = $2
+       ORDER BY descripcion ASC`,
+      [hospitalClave, categoria]
+    );
 
-    return res.json(data || {});
+    return res.json(rows);
   } catch (e) {
     console.error("Error GET /inventory:", e);
     return res.status(500).json({ ok: false, error: "error leyendo inventory" });
   }
 });
-
 
 
 
