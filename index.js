@@ -1,4 +1,4 @@
-// index.js — servidor completo y corregido
+// index.js — servidor completo: guarda y lee directo de la tabla CSV
 const express = require("express");
 const cors = require("cors");
 const morgan = require("morgan");
@@ -17,6 +17,9 @@ app.use(morgan("combined"));
 const API_TOKEN = process.env.API_TOKEN || "";
 const DATABASE_URL = process.env.DATABASE_URL || "";
 const USE_DB = !!DATABASE_URL;
+
+// Cambia aquí si tu tabla real se llama inventario_csv
+const INVENTORY_TABLE = process.env.INVENTORY_TABLE || "inventarios_csv";
 
 // FILE STORAGE fallback
 const DATA_DIR = path.join(__dirname, "data");
@@ -60,15 +63,6 @@ if (USE_DB) {
     connectionString: DATABASE_URL,
     ssl: { rejectUnauthorized: false }
   });
-
-  pool.connect()
-    .then(client => {
-      client.release();
-      console.log("Conexión a PostgreSQL OK (POOL inicializado).");
-    })
-    .catch(err => {
-      console.warn("Advertencia: no se pudo conectar a Postgres al iniciar:", err.message || err);
-    });
 }
 
 // ======================
@@ -169,6 +163,62 @@ function safeFileNameSegment(s) {
 }
 
 // ======================
+// DB SCHEMA
+// ======================
+async function ensureDbSchema() {
+  if (!USE_DB) return;
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ${INVENTORY_TABLE} (
+      hospital_clave TEXT NOT NULL,
+      hospital_nombre TEXT NOT NULL,
+      categoria TEXT NOT NULL,
+      uid TEXT,
+      clave TEXT NOT NULL,
+      descripcion TEXT,
+      stock INT,
+      minimo INT,
+      fecha DATE,
+      dias_restantes INT,
+      observaciones TEXT,
+      color TEXT,
+      manual BOOLEAN DEFAULT FALSE,
+      saved_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    ALTER TABLE ${INVENTORY_TABLE}
+    ADD COLUMN IF NOT EXISTS uid TEXT;
+  `);
+
+  await pool.query(`
+    ALTER TABLE ${INVENTORY_TABLE}
+    ADD COLUMN IF NOT EXISTS observaciones TEXT;
+  `);
+
+  await pool.query(`
+    ALTER TABLE ${INVENTORY_TABLE}
+    ADD COLUMN IF NOT EXISTS color TEXT;
+  `);
+
+  await pool.query(`
+    ALTER TABLE ${INVENTORY_TABLE}
+    ADD COLUMN IF NOT EXISTS manual BOOLEAN DEFAULT FALSE;
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_${INVENTORY_TABLE}_hosp_cat
+    ON ${INVENTORY_TABLE} (hospital_clave, categoria);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_${INVENTORY_TABLE}_uid
+    ON ${INVENTORY_TABLE} (hospital_clave, categoria, uid);
+  `);
+}
+
+// ======================
 // TOKEN OPTIONAL
 // ======================
 function requireTokenIfSet(req, res, next) {
@@ -187,6 +237,26 @@ function requireTokenIfSet(req, res, next) {
   if (tokenQuery && tokenQuery === API_TOKEN) return next();
 
   return res.status(401).json({ ok: false, error: "Unauthorized: missing/invalid token" });
+}
+
+// ======================
+// NORMALIZERS
+// ======================
+function normalizeInventoryRow(row = {}) {
+  return {
+    uid: String(row.uid || "").trim(),
+    clave: String(row.clave || "").trim(),
+    descripcion: row.descripcion || "",
+    stock: row.stock !== null && row.stock !== undefined ? String(row.stock) : "",
+    minimo: row.minimo !== null && row.minimo !== undefined ? String(row.minimo) : "",
+    fecha: row.fecha ? String(row.fecha).slice(0, 10) : "",
+    dias: row.dias !== null && row.dias !== undefined
+      ? String(row.dias)
+      : (row.dias_restantes !== null && row.dias_restantes !== undefined ? String(row.dias_restantes) : ""),
+    observaciones: row.observaciones || "",
+    color: row.color || "",
+    manual: !!row.manual
+  };
 }
 
 // ======================
@@ -244,56 +314,90 @@ app.post("/submit", requireTokenIfSet, async (req, res) => {
   }
 });
 
+// ======================
+// INVENTORY (única fuente: INVENTORY_TABLE)
+// ======================
 app.post("/inventory", requireTokenIfSet, async (req, res) => {
   try {
     const { hospitalClave, hospitalNombre, categoria, items } = req.body || {};
 
-    if (!categoria || !Array.isArray(items)) {
-      return res.status(400).json({ ok: false, error: "falta categoria o items" });
+    if (!hospitalClave || !hospitalNombre || !categoria || !Array.isArray(items)) {
+      return res.status(400).json({ ok: false, error: "falta hospitalClave, hospitalNombre, categoria o items" });
+    }
+
+    if (!USE_DB) {
+      return res.status(400).json({ ok: false, error: "Base de datos no conectada" });
     }
 
     const itemsWithUid = items.map(it => {
-      if (it && it.uid) return it;
-      const uid = crypto.randomUUID
-        ? crypto.randomUUID()
-        : `uid-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      return { ...it, uid };
+      const uid = String(it?.uid || "").trim() || (crypto.randomUUID ? crypto.randomUUID() : `uid-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+      return {
+        uid,
+        clave: String(it?.clave || "").trim(),
+        descripcion: String(it?.descripcion || ""),
+        stock: it?.stock ?? "",
+        minimo: it?.minimo ?? "",
+        fecha: it?.fecha ?? "",
+        dias: it?.dias ?? "",
+        observaciones: it?.observaciones ?? "",
+        color: it?.color ?? "",
+        manual: !!it?.manual
+      };
     });
 
-    if (USE_DB) {
-      await pool.query(
-        `INSERT INTO inventarios (hospital_clave, hospital_nombre, categoria, items, saved_at)
-         VALUES ($1, $2, $3, $4::jsonb, $5)`,
-        [hospitalClave || "", hospitalNombre || "", categoria, JSON.stringify(itemsWithUid), new Date().toISOString()]
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      // Reemplaza el estado actual de esa categoría/hospital
+      await client.query(
+        `DELETE FROM ${INVENTORY_TABLE}
+         WHERE hospital_clave = $1 AND categoria = $2`,
+        [hospitalClave, categoria]
       );
+
+      for (const it of itemsWithUid) {
+        await client.query(
+          `INSERT INTO ${INVENTORY_TABLE}
+           (hospital_clave, hospital_nombre, categoria, uid, clave, descripcion, stock, minimo, fecha, dias_restantes, observaciones, color, manual, saved_at)
+           VALUES
+           ($1, $2, $3, $4, $5, $6,
+            NULLIF($7, '')::int,
+            NULLIF($8, '')::int,
+            NULLIF($9, '')::date,
+            NULLIF($10, '')::int,
+            $11, $12, $13, NOW())`,
+          [
+            hospitalClave || "",
+            hospitalNombre || "",
+            categoria || "",
+            it.uid || "",
+            it.clave || "",
+            it.descripcion || "",
+            it.stock || "",
+            it.minimo || "",
+            it.fecha || "",
+            it.dias || "",
+            it.observaciones || "",
+            it.color || "",
+            !!it.manual
+          ]
+        );
+      }
+
+      await client.query("COMMIT");
       return res.json({ ok: true, savedAt: new Date().toISOString() });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
     }
-
-    const key = (hospitalClave && hospitalClave.trim()) ||
-      (hospitalNombre && hospitalNombre.trim()) ||
-      `unknown-${Date.now()}`;
-
-    const fileName = `${safeFileNameSegment(key)}--${safeFileNameSegment(categoria)}.json`;
-    const filePath = path.join(INVENT_DIR, fileName);
-
-    const payload = {
-      savedAt: new Date().toISOString(),
-      hospitalClave: hospitalClave || "",
-      hospitalNombre: hospitalNombre || "",
-      categoria,
-      items: itemsWithUid
-    };
-
-    await ensureStorage();
-    await writeJsonSafe(filePath, payload);
-
-    return res.json({ ok: true, savedAt: payload.savedAt, file: fileName });
   } catch (e) {
     console.error("Error POST /inventory:", e);
     return res.status(500).json({ ok: false, error: "error guardando inventory" });
   }
 });
-
 
 app.get("/inventory", async (req, res) => {
   try {
@@ -313,6 +417,7 @@ app.get("/inventory", async (req, res) => {
          hospital_clave,
          hospital_nombre,
          categoria,
+         uid,
          clave,
          descripcion,
          stock,
@@ -321,22 +426,19 @@ app.get("/inventory", async (req, res) => {
          dias_restantes,
          observaciones,
          color,
-         manual,
-         uid
-       FROM inventarios_csv
+         manual
+       FROM ${INVENTORY_TABLE}
        WHERE hospital_clave = $1 AND categoria = $2
        ORDER BY descripcion ASC`,
       [hospitalClave, categoria]
     );
 
-    return res.json(rows);
+    return res.json(rows.map(normalizeInventoryRow));
   } catch (e) {
     console.error("Error GET /inventory:", e);
     return res.status(500).json({ ok: false, error: "error leyendo inventory" });
   }
 });
-
-
 
 app.post("/inventory/item/delete", requireTokenIfSet, async (req, res) => {
   try {
@@ -346,71 +448,37 @@ app.post("/inventory/item/delete", requireTokenIfSet, async (req, res) => {
       return res.status(400).json({ ok: false, error: "falta hospitalClave, categoria o uids" });
     }
 
-    if (USE_DB) {
-      const { rows } = await pool.query(
-        `SELECT id, items
-         FROM inventarios
-         WHERE hospital_clave = $1 AND categoria = $2
-         ORDER BY id DESC
-         LIMIT 1`,
-        [hospitalClave, categoria]
-      );
-
-      if (!rows || !rows.length) {
-        return res.status(404).json({ ok: false, error: "no inventory found" });
-      }
-
-
-      
-
-
-      let items = rows[0].items;
-      if (!Array.isArray(items)) {
-        try {
-          items = JSON.parse(items);
-        } catch {
-          items = [];
-        }
-      }
-
-      const before = items.length;
-      const setUids = new Set(uids.map(String));
-      const filtered = items.filter(it => !setUids.has(String(it && it.uid)));
-
-      if (filtered.length === before) {
-        return res.json({ ok: true, modified: false, remaining: filtered.length });
-      }
-
-      await pool.query(
-        `UPDATE inventarios SET items = $1::jsonb WHERE id = $2`,
-        [JSON.stringify(filtered), rows[0].id]
-      );
-
-      return res.json({ ok: true, modified: true, remaining: filtered.length });
+    if (!USE_DB) {
+      return res.status(400).json({ ok: false, error: "Base de datos no conectada" });
     }
 
-    const fileName = `${safeFileNameSegment(hospitalClave)}--${safeFileNameSegment(categoria)}.json`;
-    const filePath = path.join(INVENT_DIR, fileName);
-    const data = await readJsonSafe(filePath);
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
 
-    if (!data || !Array.isArray(data.items)) {
-      return res.status(404).json({ ok: false, error: "no inventory file found" });
+      // Borra exactamente por uid en la tabla única
+      await client.query(
+        `DELETE FROM ${INVENTORY_TABLE}
+         WHERE hospital_clave = $1
+           AND categoria = $2
+           AND uid = ANY($3::text[])`,
+        [hospitalClave, categoria, uids.map(String)]
+      );
+
+      await client.query("COMMIT");
+      return res.json({ ok: true, modified: true });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
     }
-
-    const before = data.items.length;
-    const setUids = new Set(uids.map(String));
-    data.items = data.items.filter(it => !setUids.has(String(it && it.uid)));
-
-    await writeJsonSafe(filePath, data);
-
-    return res.json({ ok: true, modified: data.items.length !== before, remaining: data.items.length });
   } catch (e) {
     console.error("Error POST /inventory/item/delete:", e);
     return res.status(500).json({ ok: false, error: "error eliminando items" });
   }
 });
 
-// Consulta de inventario base por hospital
 app.get("/inventory-base", async (req, res) => {
   try {
     const { hospitalClave } = req.query;
@@ -431,8 +499,9 @@ app.get("/inventory-base", async (req, res) => {
          minimo,
          fecha,
          dias_restantes
-       FROM inventarios_csv
-       WHERE hospital_clave = $1
+       FROM ${INVENTORY_TABLE}
+       WHERE TRIM(LOWER(hospital_clave)) = TRIM(LOWER($1))
+          OR TRIM(LOWER(hospital_nombre)) = TRIM(LOWER($1))
        ORDER BY descripcion ASC`,
       [hospitalClave]
     );
@@ -507,7 +576,8 @@ const PORT = parseInt(process.env.PORT || "3000", 10);
       await ensureStorage();
       console.log("Modo FILE (fallback). Archivos en:", DATA_DIR);
     } else {
-      console.log("Modo DB: usando PostgreSQL (DATABASE_URL detectado).");
+      await ensureDbSchema();
+      console.log(`Modo DB: usando PostgreSQL con tabla ${INVENTORY_TABLE}.`);
     }
 
     app.listen(PORT, () => {
