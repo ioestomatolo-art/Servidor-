@@ -12,7 +12,7 @@ app.use(express.json({ limit: "5mb" }));
 app.use(morgan("combined"));
 
 // ======================
-// CONFIG
+// CONFIG                
 // ======================
 const API_TOKEN = process.env.API_TOKEN || "";
 const DATABASE_URL = process.env.DATABASE_URL || "";
@@ -139,7 +139,8 @@ async function ensureStorage() {
     await fs.writeFile(SUBMISSIONS_FILE, JSON.stringify([], null, 2), "utf8");
   }
 }
-
+//========
+//=======
 async function readJsonSafe(filePath) {
   try {
     const content = await fs.readFile(filePath, "utf8");
@@ -581,4 +582,58 @@ const PORT = parseInt(process.env.PORT || "3000", 10);
     console.error("No se pudo iniciar el servidor:", err);
     process.exit(1);
   }
+
+
+
+
+
+
+
+  const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "";
+const ADMIN_TOKENS = new Map();
+
+function makeAdminToken() {
+  return crypto.randomBytes(32).toString("hex");
+}
+
+function requireAdminSession(req, res, next) {
+  const token = (
+    req.headers["x-admin-token"] ||
+    req.query.token ||
+    ""
+  ).toString().trim();
+
+  if (!token) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+
+  const expiresAt = ADMIN_TOKENS.get(token);
+  if (!expiresAt || expiresAt < Date.now()) {
+    ADMIN_TOKENS.delete(token);
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+
+  return next();
+}
+
+app.post("/admin/login", (req, res) => {
+  try {
+    const { password } = req.body || {};
+    if (!ADMIN_PASSWORD) {
+      return res.status(500).json({ ok: false, error: "ADMIN_PASSWORD no configurada" });
+    }
+
+    if ((password || "") !== ADMIN_PASSWORD) {
+      return res.status(401).json({ ok: false, error: "Contraseña inválida" });
+    }
+
+    const token = makeAdminToken();
+    ADMIN_TOKENS.set(token, Date.now() + 8 * 60 * 60 * 1000); // 8 horas
+
+    return res.json({ ok: true, token, expiresIn: 8 * 60 * 60 });
+  } catch (e) {
+    console.error("Error /admin/login:", e);
+    return res.status(500).json({ ok: false, error: "error interno" });
+  }
+});
 })();
