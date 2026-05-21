@@ -12,9 +12,10 @@ app.use(express.json({ limit: "5mb" }));
 app.use(morgan("combined"));
 
 // ======================
-// CONFIG                
+// CONFIG
 // ======================
 const API_TOKEN = process.env.API_TOKEN || "";
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "";
 const DATABASE_URL = process.env.DATABASE_URL || "";
 const USE_DB = !!DATABASE_URL;
 
@@ -23,6 +24,7 @@ const INVENTORY_TABLE = "inventarios_csv";
 
 // FILE STORAGE fallback
 const DATA_DIR = path.join(__dirname, "data");
+const INVENT_DIR = path.join(DATA_DIR, "inventories");
 const SUBMISSIONS_FILE = path.join(DATA_DIR, "submissions.json");
 
 // ======================
@@ -43,7 +45,7 @@ app.use((req, res, next) => {
 
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-admin-token");
 
   if (req.method === "OPTIONS") {
     return res.sendStatus(204);
@@ -133,14 +135,15 @@ const HOSPITALES = [
 // ======================
 async function ensureStorage() {
   await fs.mkdir(DATA_DIR, { recursive: true });
+  await fs.mkdir(INVENT_DIR, { recursive: true });
+
   try {
     await fs.access(SUBMISSIONS_FILE);
   } catch {
     await fs.writeFile(SUBMISSIONS_FILE, JSON.stringify([], null, 2), "utf8");
   }
 }
-//========
-//=======
+
 async function readJsonSafe(filePath) {
   try {
     const content = await fs.readFile(filePath, "utf8");
@@ -154,30 +157,17 @@ async function writeJsonSafe(filePath, obj) {
   await fs.writeFile(filePath, JSON.stringify(obj, null, 2), "utf8");
 }
 
-// ======================
-// TOKEN OPTIONAL
-// ======================
-function requireTokenIfSet(req, res, next) {
-  if (!API_TOKEN) return next();
-
-  const authHeader = (req.headers.authorization || "").trim();
-  if (authHeader.toLowerCase().startsWith("bearer ")) {
-    const tk = authHeader.slice(7).trim();
-    if (tk === API_TOKEN) return next();
-  }
-
-  const bodyToken = req.body && req.body._token;
-  if (bodyToken && bodyToken === API_TOKEN) return next();
-
-  const tokenQuery = (req.query.token || "").trim();
-  if (tokenQuery && tokenQuery === API_TOKEN) return next();
-
-  return res.status(401).json({ ok: false, error: "Unauthorized: missing/invalid token" });
+function safeFileNameSegment(s) {
+  if (!s) return "unknown";
+  return String(s).replace(/[^a-z0-9\-_]/gi, "_").slice(0, 120);
 }
 
-// ======================
-// HELPERS
-// ======================
+function inventoryFilePath(hospitalClave, categoria) {
+  const key = safeFileNameSegment(hospitalClave);
+  const cat = safeFileNameSegment(categoria);
+  return path.join(INVENT_DIR, `${key}--${cat}.json`);
+}
+
 function normalizeInventoryRow(row = {}) {
   return {
     uid: String(row.uid || "").trim(),
@@ -188,7 +178,7 @@ function normalizeInventoryRow(row = {}) {
     fecha: row.fecha !== null && row.fecha !== undefined ? String(row.fecha).slice(0, 10) : "",
     dias: row.dias_restantes !== null && row.dias_restantes !== undefined
       ? String(row.dias_restantes)
-      : "",
+      : (row.dias !== null && row.dias !== undefined ? String(row.dias) : ""),
     observaciones: row.observaciones || "",
     color: row.color || "",
     manual: !!row.manual
@@ -213,6 +203,142 @@ function legacyRowUid(row = {}) {
   return crypto.createHash("md5").update(seed).digest("hex");
 }
 
+async function readInventoryFile(hospitalClave, categoria) {
+  const filePath = inventoryFilePath(hospitalClave, categoria);
+  const data = await readJsonSafe(filePath);
+  return data && typeof data === "object" ? data : null;
+}
+
+async function writeInventoryFile(hospitalClave, categoria, payload) {
+  const filePath = inventoryFilePath(hospitalClave, categoria);
+  await ensureStorage();
+  await writeJsonSafe(filePath, payload);
+}
+
+async function listInventoryForHospital(hospitalKey) {
+  await ensureStorage();
+  const files = await fs.readdir(INVENT_DIR).catch(() => []);
+  const target = String(hospitalKey || "").trim().toLowerCase();
+  const rows = [];
+
+  for (const file of files) {
+    if (!file.endsWith(".json")) continue;
+    const filePath = path.join(INVENT_DIR, file);
+    const data = await readJsonSafe(filePath);
+    if (!data || typeof data !== "object") continue;
+
+    const hClave = String(data.hospitalClave || "").trim().toLowerCase();
+    const hNombre = String(data.hospitalNombre || "").trim().toLowerCase();
+    if (hClave !== target && hNombre !== target) continue;
+
+    const categoria = String(data.categoria || "").trim().toLowerCase();
+    const items = Array.isArray(data.items) ? data.items : [];
+    for (const it of items) {
+      rows.push({
+        hospital_clave: data.hospitalClave || "",
+        hospital_nombre: data.hospitalNombre || "",
+        categoria,
+        uid: it.uid || legacyRowUid({ ...it, hospital_clave: data.hospitalClave || "", categoria }),
+        clave: it.clave || "",
+        descripcion: it.descripcion || "",
+        stock: it.stock,
+        minimo: it.minimo,
+        fecha: it.fecha || "",
+        dias_restantes: it.dias || it.dias_restantes,
+        observaciones: it.observaciones || "",
+        color: it.color || "",
+        manual: !!it.manual
+      });
+    }
+  }
+
+  return rows;
+}
+
+// ======================
+// ADMIN AUTH
+// ======================
+const ADMIN_TOKENS = new Map();
+
+function makeAdminToken() {
+  return crypto.randomBytes(32).toString("hex");
+}
+
+function cleanupAdminTokens() {
+  const now = Date.now();
+  for (const [token, expiresAt] of ADMIN_TOKENS.entries()) {
+    if (!expiresAt || expiresAt < now) ADMIN_TOKENS.delete(token);
+  }
+}
+setInterval(cleanupAdminTokens, 30 * 60 * 1000).unref?.();
+
+function getAdminTokenFromRequest(req) {
+  const authHeader = (req.headers.authorization || "").trim();
+  const tokenQuery = (req.query.token || "").trim();
+  const tokenX = (req.headers["x-admin-token"] || "").toString().trim();
+
+  if (authHeader.toLowerCase().startsWith("bearer ")) return authHeader.slice(7).trim();
+  if (tokenX) return tokenX;
+  if (tokenQuery) return tokenQuery;
+  return "";
+}
+
+function requireAdminSession(req, res, next) {
+  const token = getAdminTokenFromRequest(req);
+  if (!token) return res.status(401).json({ ok: false, error: "Unauthorized" });
+
+  const expiresAt = ADMIN_TOKENS.get(token);
+  if (!expiresAt || expiresAt < Date.now()) {
+    ADMIN_TOKENS.delete(token);
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+
+  return next();
+}
+
+app.post("/admin/login", (req, res) => {
+  try {
+    const { password } = req.body || {};
+
+    if (!ADMIN_PASSWORD) {
+      return res.status(500).json({ ok: false, error: "ADMIN_PASSWORD no configurada" });
+    }
+
+    if ((password || "") !== ADMIN_PASSWORD) {
+      return res.status(401).json({ ok: false, error: "Contraseña inválida" });
+    }
+
+    const token = makeAdminToken();
+    ADMIN_TOKENS.set(token, Date.now() + 8 * 60 * 60 * 1000); // 8 horas
+
+    return res.json({ ok: true, token, expiresIn: 8 * 60 * 60 });
+  } catch (e) {
+    console.error("Error /admin/login:", e);
+    return res.status(500).json({ ok: false, error: "error interno" });
+  }
+});
+
+// ======================
+// TOKEN OPTIONAL
+// ======================
+function requireTokenIfSet(req, res, next) {
+  if (!API_TOKEN) return next();
+
+  const authHeader = (req.headers.authorization || "").trim();
+  if (authHeader.toLowerCase().startsWith("bearer ")) {
+    const tk = authHeader.slice(7).trim();
+    if (tk === API_TOKEN) return next();
+  }
+
+  const bodyToken = req.body && req.body._token;
+  if (bodyToken && bodyToken === API_TOKEN) return next();
+
+  const tokenQuery = (req.query.token || "").trim();
+  if (tokenQuery && tokenQuery === API_TOKEN) return next();
+
+  return res.status(401).json({ ok: false, error: "Unauthorized: missing/invalid token" });
+}
+
 // ======================
 // DB SCHEMA
 // ======================
@@ -220,7 +346,16 @@ async function ensureDbSchema() {
   if (!USE_DB) return;
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS submissions (
+      id TEXT PRIMARY KEY,
+      payload JSONB NOT NULL,
+      received_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS ${INVENTORY_TABLE} (
+      id BIGSERIAL PRIMARY KEY,
       hospital_clave TEXT NOT NULL,
       hospital_nombre TEXT NOT NULL,
       categoria TEXT NOT NULL,
@@ -291,7 +426,7 @@ app.post("/submit", requireTokenIfSet, async (req, res) => {
     if (USE_DB) {
       await pool.query(
         `INSERT INTO submissions (id, payload, received_at)
-         VALUES ($1, $2::json, $3)`,
+         VALUES ($1, $2::jsonb, $3)`,
         [id, JSON.stringify(payload), receivedAt]
       );
       return res.json({ ok: true, id, savedAt: receivedAt });
@@ -309,9 +444,6 @@ app.post("/submit", requireTokenIfSet, async (req, res) => {
   }
 });
 
-// ======================
-// INVENTORY
-// ======================
 // Guarda reemplazando el estado completo de hospital + categoría
 app.post("/inventory", requireTokenIfSet, async (req, res) => {
   try {
@@ -321,65 +453,77 @@ app.post("/inventory", requireTokenIfSet, async (req, res) => {
       return res.status(400).json({ ok: false, error: "falta hospitalClave, hospitalNombre, categoria o items" });
     }
 
-    if (!USE_DB) {
-      return res.status(400).json({ ok: false, error: "Base de datos no conectada" });
-    }
+    const itemsWithUid = items.map(it => {
+      const uid = String(it?.uid || "").trim() || (crypto.randomUUID ? crypto.randomUUID() : `uid-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+      return { ...it, uid };
+    });
 
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-
-      await client.query(
-        `DELETE FROM inventarios_csv
-         WHERE hospital_clave = $1 AND categoria = $2`,
-        [hospitalClave, categoria]
-      );
-
-      for (const it of items) {
-        const uid = String(it?.uid || "").trim() || (crypto.randomUUID ? crypto.randomUUID() : `uid-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+    if (USE_DB) {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
 
         await client.query(
-          `INSERT INTO inventarios_csv
-           (hospital_clave, hospital_nombre, categoria, uid, clave, descripcion, stock, minimo, fecha, dias_restantes, observaciones, color, manual)
-           VALUES
-           ($1, $2, $3, $4, $5, $6,
-            NULLIF($7, '')::int,
-            NULLIF($8, '')::int,
-            $9,
-            NULLIF($10, '')::int,
-            $11, $12, $13)`,
-          [
-            hospitalClave || "",
-            hospitalNombre || "",
-            categoria || "",
-            uid,
-            it.clave || "",
-            it.descripcion || "",
-            it.stock || "",
-            it.minimo || "",
-            it.fecha || "",
-            it.dias || "",
-            it.observaciones || "",
-            it.color || "",
-            !!it.manual
-          ]
+          `DELETE FROM ${INVENTORY_TABLE}
+           WHERE hospital_clave = $1 AND categoria = $2`,
+          [hospitalClave, categoria]
         );
-      }
 
-      await client.query("COMMIT");
-      return res.json({ ok: true, savedAt: new Date().toISOString() });
-    } catch (err) {
-      await client.query("ROLLBACK");
-      console.error("ERROR REAL POST /inventory:", err);
-      throw err;
-    } finally {
-      client.release();
+        for (const it of itemsWithUid) {
+          await client.query(
+            `INSERT INTO ${INVENTORY_TABLE}
+             (hospital_clave, hospital_nombre, categoria, uid, clave, descripcion, stock, minimo, fecha, dias_restantes, observaciones, color, manual)
+             VALUES
+             ($1, $2, $3, $4, $5, $6,
+              NULLIF($7, '')::int,
+              NULLIF($8, '')::int,
+              $9,
+              NULLIF($10, '')::int,
+              $11, $12, $13)`,
+            [
+              hospitalClave || "",
+              hospitalNombre || "",
+              categoria || "",
+              it.uid,
+              it.clave || "",
+              it.descripcion || "",
+              it.stock || "",
+              it.minimo || "",
+              it.fecha || "",
+              it.dias || "",
+              it.observaciones || "",
+              it.color || "",
+              !!it.manual
+            ]
+          );
+        }
+
+        await client.query("COMMIT");
+        return res.json({ ok: true, savedAt: new Date().toISOString() });
+      } catch (err) {
+        await client.query("ROLLBACK");
+        console.error("ERROR POST /inventory:", err);
+        throw err;
+      } finally {
+        client.release();
+      }
     }
+
+    const payload = {
+      savedAt: new Date().toISOString(),
+      hospitalClave: hospitalClave || "",
+      hospitalNombre: hospitalNombre || "",
+      categoria,
+      items: itemsWithUid
+    };
+    await writeInventoryFile(hospitalClave, categoria, payload);
+    return res.json({ ok: true, savedAt: payload.savedAt });
   } catch (e) {
     console.error("Error POST /inventory:", e);
     return res.status(500).json({ ok: false, error: "error guardando inventory" });
   }
 });
+
 app.get("/inventory", async (req, res) => {
   try {
     const hospitalClave = (req.query.hospitalClave || req.query.hospitalNombre || "").trim();
@@ -389,32 +533,34 @@ app.get("/inventory", async (req, res) => {
       return res.json([]);
     }
 
-    if (!USE_DB) {
-      return res.status(400).json({ ok: false, error: "Base de datos no conectada" });
+    if (USE_DB) {
+      const { rows } = await pool.query(
+        `SELECT
+           hospital_clave,
+           hospital_nombre,
+           categoria,
+           uid,
+           clave,
+           descripcion,
+           stock,
+           minimo,
+           fecha,
+           dias_restantes,
+           observaciones,
+           color,
+           manual
+         FROM ${INVENTORY_TABLE}
+         WHERE hospital_clave = $1 AND categoria = $2
+         ORDER BY id ASC`,
+        [hospitalClave, categoria]
+      );
+
+      return res.json(rows.map(normalizeInventoryRow));
     }
 
-    const { rows } = await pool.query(
-      `SELECT
-         hospital_clave,
-         hospital_nombre,
-         categoria,
-         uid,
-         clave,
-         descripcion,
-         stock,
-         minimo,
-         fecha,
-         dias_restantes,
-         observaciones,
-         color,
-         manual
-       FROM ${INVENTORY_TABLE}
-       WHERE hospital_clave = $1 AND categoria = $2
-       ORDER BY descripcion ASC`,
-      [hospitalClave, categoria]
-    );
-
-    return res.json(rows.map(normalizeInventoryRow));
+    const data = await readInventoryFile(hospitalClave, categoria);
+    if (!data) return res.json([]);
+    return res.json(data);
   } catch (e) {
     console.error("Error GET /inventory:", e);
     return res.status(500).json({ ok: false, error: "error leyendo inventory" });
@@ -429,38 +575,47 @@ app.post("/inventory/item/delete", requireTokenIfSet, async (req, res) => {
       return res.status(400).json({ ok: false, error: "falta hospitalClave, categoria o uids" });
     }
 
-    if (!USE_DB) {
-      return res.status(400).json({ ok: false, error: "Base de datos no conectada" });
-    }
-
     const uidSet = uids.map(String).filter(Boolean);
 
-    const { rowCount } = await pool.query(
-      `DELETE FROM ${INVENTORY_TABLE}
-       WHERE hospital_clave = $1
-         AND categoria = $2
-         AND (
-           uid = ANY($3::text[])
-           OR md5(
-             concat_ws('|',
-               coalesce(hospital_clave, ''),
-               coalesce(categoria, ''),
-               coalesce(clave, ''),
-               coalesce(descripcion, ''),
-               coalesce(stock::text, ''),
-               coalesce(minimo::text, ''),
-               coalesce(fecha::text, ''),
-               coalesce(dias_restantes::text, ''),
-               coalesce(observaciones, ''),
-               coalesce(color, ''),
-               coalesce(manual::text, '')
-             )
-           ) = ANY($3::text[])
-         )`,
-      [hospitalClave, categoria, uidSet]
-    );
+    if (USE_DB) {
+      const { rowCount } = await pool.query(
+        `DELETE FROM ${INVENTORY_TABLE}
+         WHERE hospital_clave = $1
+           AND categoria = $2
+           AND (
+             uid = ANY($3::text[])
+             OR md5(
+               concat_ws('|',
+                 coalesce(hospital_clave, ''),
+                 coalesce(categoria, ''),
+                 coalesce(clave, ''),
+                 coalesce(descripcion, ''),
+                 coalesce(stock::text, ''),
+                 coalesce(minimo::text, ''),
+                 coalesce(fecha::text, ''),
+                 coalesce(dias_restantes::text, ''),
+                 coalesce(observaciones, ''),
+                 coalesce(color, ''),
+                 coalesce(manual::text, '')
+               )
+             ) = ANY($3::text[])
+           )`,
+        [hospitalClave, categoria, uidSet]
+      );
 
-    return res.json({ ok: true, modified: rowCount > 0, deleted: rowCount });
+      return res.json({ ok: true, modified: rowCount > 0, deleted: rowCount });
+    }
+
+    const data = await readInventoryFile(hospitalClave, categoria);
+    if (!data || !Array.isArray(data.items)) {
+      return res.status(404).json({ ok: false, error: "no inventory file found" });
+    }
+
+    const before = data.items.length;
+    data.items = data.items.filter(it => !uidSet.has(String(it?.uid || "")));
+    await writeInventoryFile(hospitalClave, categoria, data);
+
+    return res.json({ ok: true, modified: data.items.length !== before, deleted: before - data.items.length });
   } catch (e) {
     console.error("Error POST /inventory/item/delete:", e);
     return res.status(500).json({ ok: false, error: "error eliminando items" });
@@ -474,32 +629,33 @@ app.get("/inventory-base", async (req, res) => {
       return res.status(400).json({ ok: false, error: "Falta hospitalClave" });
     }
 
-    if (!USE_DB) {
-      return res.status(400).json({ ok: false, error: "Base de datos no conectada" });
+    if (USE_DB) {
+      const { rows } = await pool.query(
+        `SELECT
+           hospital_clave,
+           hospital_nombre,
+           LOWER(TRIM(categoria)) AS categoria,
+           uid,
+           clave,
+           descripcion,
+           stock,
+           minimo,
+           fecha,
+           dias_restantes,
+           observaciones,
+           color,
+           manual
+         FROM ${INVENTORY_TABLE}
+         WHERE TRIM(LOWER(hospital_clave)) = TRIM(LOWER($1))
+            OR TRIM(LOWER(hospital_nombre)) = TRIM(LOWER($1))
+         ORDER BY categoria ASC, descripcion ASC`,
+        [hospitalClave]
+      );
+
+      return res.json(rows);
     }
 
-    const { rows } = await pool.query(
-      `SELECT
-         hospital_clave,
-         hospital_nombre,
-         LOWER(TRIM(categoria)) AS categoria,
-         uid,
-         clave,
-         descripcion,
-         stock,
-         minimo,
-         fecha,
-         dias_restantes,
-         observaciones,
-         color,
-         manual
-       FROM ${INVENTORY_TABLE}
-       WHERE TRIM(LOWER(hospital_clave)) = TRIM(LOWER($1))
-          OR TRIM(LOWER(hospital_nombre)) = TRIM(LOWER($1))
-       ORDER BY categoria ASC, descripcion ASC`,
-      [hospitalClave]
-    );
-
+    const rows = await listInventoryForHospital(hospitalClave);
     return res.json(rows);
   } catch (e) {
     console.error("Error GET /inventory-base:", e);
@@ -507,20 +663,7 @@ app.get("/inventory-base", async (req, res) => {
   }
 });
 
-app.get("/submissions", async (req, res) => {
-  if (API_TOKEN) {
-    const authHeader = (req.headers.authorization || "").trim();
-    const tokenQuery = (req.query.token || "").trim();
-    let ok = false;
-
-    if (authHeader.toLowerCase().startsWith("bearer ")) {
-      ok = authHeader.slice(7).trim() === API_TOKEN;
-    }
-    if (!ok && tokenQuery) ok = tokenQuery === API_TOKEN;
-
-    if (!ok) return res.status(401).json({ ok: false, error: "Unauthorized" });
-  }
-
+app.get("/submissions", requireAdminSession, async (req, res) => {
   try {
     if (USE_DB) {
       const { rows } = await pool.query(
@@ -559,6 +702,123 @@ app.get("/submissions", async (req, res) => {
   }
 });
 
+app.get("/report", requireAdminSession, async (req, res) => {
+  try {
+    let submissions = [];
+
+    if (USE_DB) {
+      const { rows } = await pool.query(
+        `SELECT id, payload, received_at FROM submissions ORDER BY received_at DESC`
+      );
+
+      submissions = rows.map(r => {
+        let payload = r.payload;
+        try {
+          if (typeof payload === "string") payload = JSON.parse(payload);
+        } catch {}
+
+        return { id: r.id, receivedAt: r.received_at, ...payload };
+      });
+    } else {
+      await ensureStorage();
+      submissions = (await readJsonSafe(SUBMISSIONS_FILE)) || [];
+    }
+
+    if (!Array.isArray(submissions) || submissions.length === 0) {
+      return res.status(204).send();
+    }
+
+    const rowsOut = [];
+    for (const s of submissions) {
+      const base = {
+        submissionId: s.id || s.submissionId || "",
+        receivedAt: s.receivedAt || s.fechaEnvio || "",
+        hospitalNombre: s.hospitalNombre || "",
+        hospitalClave: s.hospitalClave || "",
+        categoria: s.categoria || "",
+        fechaEnvio: s.fechaEnvio || ""
+      };
+
+      const items = Array.isArray(s.items) ? s.items : [];
+      if (items.length === 0) {
+        rowsOut.push({
+          ...base,
+          clave: "",
+          descripcion: "",
+          stock: "",
+          minimo: "",
+          fecha: "",
+          dias: "",
+          observaciones: "",
+          color: "",
+          manual: ""
+        });
+      } else {
+        for (const it of items) {
+          rowsOut.push({
+            ...base,
+            clave: it.clave || "",
+            descripcion: it.descripcion || "",
+            stock: it.stock || "",
+            minimo: it.minimo || "",
+            fecha: it.fecha || "",
+            dias: it.dias || "",
+            observaciones: it.observaciones || "",
+            color: it.color || "",
+            manual: (it.manual === true || it.manual === "true") ? "true" : ""
+          });
+        }
+      }
+    }
+
+    const format = (req.query.format || "csv").toLowerCase();
+    if (format === "json") {
+      const filename = `report_submissions_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "_")}.json`;
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+      return res.send(JSON.stringify(rowsOut, null, 2));
+    }
+
+    function csvEscape(v) {
+      if (v === null || v === undefined) return "";
+      const s = String(v);
+      if (/[,"\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+      return s;
+    }
+
+    const header = [
+      "submissionId",
+      "receivedAt",
+      "hospitalNombre",
+      "hospitalClave",
+      "categoria",
+      "fechaEnvio",
+      "clave",
+      "descripcion",
+      "stock",
+      "minimo",
+      "fecha",
+      "dias",
+      "observaciones",
+      "color",
+      "manual"
+    ];
+
+    const csvLines = [header.join(",")];
+    for (const r of rowsOut) {
+      csvLines.push(header.map(h => csvEscape(r[h])).join(","));
+    }
+
+    const filename = `report_submissions_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "_")}.csv`;
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    return res.send(csvLines.join("\r\n"));
+  } catch (e) {
+    console.error("Error GET /report:", e);
+    return res.status(500).json({ ok: false, error: "error generando reporte" });
+  }
+});
+
 // ======================
 // START
 // ======================
@@ -577,63 +837,10 @@ const PORT = parseInt(process.env.PORT || "3000", 10);
     app.listen(PORT, () => {
       console.log(`Servidor iniciado en puerto ${PORT} (PID:${process.pid}) - usingDb=${USE_DB}`);
       if (API_TOKEN) console.log("API_TOKEN está configurado (endpoints protegidos).");
+      if (ADMIN_PASSWORD) console.log("ADMIN_PASSWORD está configurada (acceso admin).");
     });
   } catch (err) {
     console.error("No se pudo iniciar el servidor:", err);
     process.exit(1);
   }
-
-
-
-
-
-
-
-  const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "";
-const ADMIN_TOKENS = new Map();
-
-function makeAdminToken() {
-  return crypto.randomBytes(32).toString("hex");
-}
-
-function requireAdminSession(req, res, next) {
-  const token = (
-    req.headers["x-admin-token"] ||
-    req.query.token ||
-    ""
-  ).toString().trim();
-
-  if (!token) {
-    return res.status(401).json({ ok: false, error: "Unauthorized" });
-  }
-
-  const expiresAt = ADMIN_TOKENS.get(token);
-  if (!expiresAt || expiresAt < Date.now()) {
-    ADMIN_TOKENS.delete(token);
-    return res.status(401).json({ ok: false, error: "Unauthorized" });
-  }
-
-  return next();
-}
-
-app.post("/admin/login", (req, res) => {
-  try {
-    const { password } = req.body || {};
-    if (!ADMIN_PASSWORD) {
-      return res.status(500).json({ ok: false, error: "ADMIN_PASSWORD no configurada" });
-    }
-
-    if ((password || "") !== ADMIN_PASSWORD) {
-      return res.status(401).json({ ok: false, error: "Contraseña inválida" });
-    }
-
-    const token = makeAdminToken();
-    ADMIN_TOKENS.set(token, Date.now() + 8 * 60 * 60 * 1000); // 8 horas
-
-    return res.json({ ok: true, token, expiresIn: 8 * 60 * 60 });
-  } catch (e) {
-    console.error("Error /admin/login:", e);
-    return res.status(500).json({ ok: false, error: "error interno" });
-  }
-});
 })();
