@@ -255,6 +255,14 @@ async function listInventoryForHospital(hospitalKey) {
   return rows;
 }
 
+function toIntOrNull(value) {
+  if (value === null || value === undefined) return null;
+  const s = String(value).trim();
+  if (!s) return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? Math.trunc(n) : null;
+}
+
 // ======================
 // ADMIN AUTH
 // ======================
@@ -309,7 +317,7 @@ app.post("/admin/login", (req, res) => {
     }
 
     const token = makeAdminToken();
-    ADMIN_TOKENS.set(token, Date.now() + 8 * 60 * 60 * 1000); // 8 horas
+    ADMIN_TOKENS.set(token, Date.now() + 8 * 60 * 60 * 1000);
 
     return res.json({ ok: true, token, expiresIn: 8 * 60 * 60 });
   } catch (e) {
@@ -475,10 +483,10 @@ app.post("/inventory", requireTokenIfSet, async (req, res) => {
              (hospital_clave, hospital_nombre, categoria, uid, clave, descripcion, stock, minimo, fecha, dias_restantes, observaciones, color, manual)
              VALUES
              ($1, $2, $3, $4, $5, $6,
-              NULLIF($7, '')::int,
-              NULLIF($8, '')::int,
+              $7,
+              $8,
               $9,
-              NULLIF($10, '')::int,
+              $10,
               $11, $12, $13)`,
             [
               hospitalClave || "",
@@ -487,10 +495,10 @@ app.post("/inventory", requireTokenIfSet, async (req, res) => {
               it.uid,
               it.clave || "",
               it.descripcion || "",
-              it.stock || "",
-              it.minimo || "",
+              toIntOrNull(it.stock),
+              toIntOrNull(it.minimo),
               it.fecha || "",
-              it.dias || "",
+              toIntOrNull(it.dias),
               it.observaciones || "",
               it.color || "",
               !!it.manual
